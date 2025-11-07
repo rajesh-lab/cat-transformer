@@ -1,44 +1,119 @@
 # Compress And Attend Transformers (CATs)
 
-Worried about all the choices one needs to make for an efficient architecture!
+> [**Attention and Compression is all you need for Controllably Efficient Language Models**](https://arxiv.org/abs)<br>
+> [Jatin Prakash](https://bicycleman15.github.io), [Aahlad Puli](https://aahladmanas.github.io), [Rajesh Ranganath](https://rajesh-lab.github.io)
+> <br>New York University<br>
 
-<img width="200" height="200" alt="image" src="https://github.com/user-attachments/assets/8ea2a9dc-8dc9-4d11-ad79-67399d7ba68e" />
+This repository provides hackable, scalable and efficient pure PyTorch implementation for CATs.
 
-Enter CATs to the rescue!!
+<p align="center">
+  <img src="assets/trade_offs.png" alt="trade_offs" width="75%">
+</p>
 
 ## Overview
+- CATs model _chunks of tokens_ given compressed representations of past chunks in the sequence 😸.
+<!-- ![alt text](assets/cat_diagram.png) -->
+<p align="center">
+  <img src="assets/cat_diagram.png" alt="cat_diagram" width="50%">
+</p>
 
-- 🐈 CATs model _chunks of tokens_ given compressed representations of past chunks in the sequence
-  
-- 🗜️ Due to **_compression_**, FLOPs & KV-cache diminish by a factor of chunk size (upto **3x faster** and **7x memory efficient**)
-  
-- 📏 Choosing chunk size (i.e. how much to compress?) allows CATs to **interpolate** between compressed (fast) and dense (slow) transformer
-  
-- 😌 💆 No need to heuristically define efficient attention maps, No need to compose with other mixers to have competitive performance – **everything can be learned end-to-end** – offers a natural knob to control for the trade-off, where on one extreme, one recovers full attention (when `chunk_size` is 1)
-  
-- 🧑‍💻 No need for an efficient kernel for fast inference: We provide simple and efficient implementations for training and inference in pure PyTorch: utilizing basic attention implementations -- since CATs build on top of dense transformers!
-  
-- ✅ We provide single-file implementation for CATs
- 
+- CATs demonstrate one needs **only two simple ingredients** (dense attention and compression) to design a **simple**, **efficient** and importantly, an **adaptive** architecture. No need to heuristically define sparse attention masks; no need for handcrafted and complex recurrent state update rules; no need to carefully compose with attention at specific layers to have a capable architecture 💆‍♀️😌. (The troubled cat 😿 below describes the overwhelming feeling of designing an efficient architecture)
+<p align="center">
+  <img src="assets/troubled_cat.png" alt="troubled_cat" width="30%">
+</p>
 
+- Due to **_compression_** resulting in a reduced sequence length, compute FLOPs & KV-cache memory diminish by a factor of chunk size (upto **3x faster** and **9x memory efficient** 🚀)
+<p align="center">
+  <img src="assets/throughput.png" alt="throughput" width="50%">
+</p>
 
-<img width="300" height="250" alt="image" src="https://github.com/user-attachments/assets/9dfd3a04-a259-4a2d-a07e-e513f95b7710" />
+- Choosing chunk size (i.e. how much to compress?) allows CATs to **interpolate** between compressed (fast) and dense (slow) transformer directly at **test-time** ⏰, trading off quality for efficiency.
 
+- We take the core concepts and instantiate CAT as a layer which can be swapped in any sequence model as a **drop-in replacement**, replacing dense attention. This can unlock lots of interesting possibilities starting with creating hybrid as well as adaptive architectures that mixes CAT layers alongside dense attention, or perhaps even linear attention.
 
-Just choose chunk size (i.e. how much to compress?) and interpolate between compressed (fast) and dense (slow) transformer
+## Usage
 
-<img width="350" height="350" alt="image" src="https://github.com/user-attachments/assets/ae34c9e2-4267-4ea6-bb81-665cd62d8207" />
+> ⚠️ Right now, the implementation only supports training fixed chunk size CATs. We will release the adaptive version soon!
 
-CATs are upto 3x faster and 7x memory efficient compared to a dense transformer!
+Here are some things to keep in mind:
+- `transformer.py` contains a fast implementation for transformer++. Highly inspired from the Lightning-AI/litgpt repo. To make this implementation efficient, it uses triton kernels from linkedin/Liger-Kernel. CAT's implementation directly imports components from here since it builds on vanilla transformer abstractions.
+- `cat_transformer.py` contains a scalable implementation for CATs. We provide a simple usage that can be directly used in most training scripts.
 
-<img width="200" height="200" alt="image" src="https://github.com/user-attachments/assets/6e7a1887-618f-4ef3-8809-a27b4d101ce3" />
+> Note that according to the paper, the decoder in CAT should be made more expressive (contain more parameters) in order to accurately decode from the compressed chunk representations (refer to below usage to correctly instantiate a CAT)
 
+```python
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# below assumes that one wishes to instantiate a CAT that matches
+# a vanilla transformer containing 12 layers, and hidden size of 768
+dim = 768
+num_layers = 12
 
+# this is the hidden size of decoder, which is recommended to be 2*dim
+# however, it can be 1.5*dim, or 1.25*dim depending on the task
+# dim_fx means the size of the compressed chunk representations (f(c)'s), which
+# is same as hidden size of the decoder
+decoder_dim = 2 * dim # hidden size of the decoder
+dim_fx = decoder_dim # size of compressed chunk representations
 
+block_size = 2048 # context length
+chunk_size = 8 # chunk size
 
----
+# instantiate the model
+compressor_config = CATConfig(dim=dim, dim_fx=dim_fx, block_size=block_size, chunk_size=chunk_size, n_layer=(num_layers // 4)) # layers are defined according to the paper, but one may use lower number of layers in the compressor
+decoder_config = CATConfig(dim=decoder_dim, block_size=block_size, chunk_size=chunk_size, n_layer=num_layers)
+model = CAT_Transformer(decoder_config, compressor_config)
+model = model.to(device=device)
+model.setup_cache(device=device)
+print(model)
 
-This is official code for the paper: Autoregressive Language Modeling by Compressed Sequence Mixing
+# do forward pass
+input_ids = torch.randint(0, decoder_config.vocab_size, (4, block_size), device=device)
+logits = model(input_ids)
+# do stuff with logits ...
+```
 
-`cat_transformer.py` : contains hackable single-file implementation for the CAT transformer
+### Usage for CAT as a drop-in layer
+
+Refer to `cat_layer.py`
+
+```python
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# simple test
+batch_size = 4
+seq_len = 2048
+chunk_size = 8
+
+config = CAT_Config(
+    dim=768,
+    n_head=16,
+    chunk_size=chunk_size,
+
+    # again, needs 2*dim for accurate decoding from compressed chunk representations
+    dim_fx=2 * 768, 
+
+    block_size=seq_len,
+
+    # right now, every layer is a CAT layer
+    # but the implementation can be easily modified to create hybrid architectures :)
+    n_layer=12,
+)
+
+model = CAT_Layer_Transformer(config)
+model.setup_cache(device=device)
+model.to(device)
+
+x = torch.randint(0, config.padded_vocab_size, (batch_size, seq_len), device=device)
+
+logits = model(x)
+
+# do stuff with logits ...
+```
+
+## Acknowledgements
+This implementation borrows heavily from the following repositories:
+
+- [Lightning-AI/litgpt](https://github.com/Lightning-AI/litgpt)
+- [linkedin/Liger-Kernel](https://github.com/linkedin/Liger-Kernel)
+- [meta-pytorch/gpt-fast](https://github.com/meta-pytorch/gpt-fast)
