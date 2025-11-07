@@ -17,6 +17,8 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
+from liger_kernel.transformers import LigerRMSNorm, liger_rotary_pos_emb, LigerFusedLinearCrossEntropyLoss
+from liger_kernel.ops.swiglu import LigerSiLUMulFunction
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -44,10 +46,9 @@ def get_mask_mod(mask_mod: _mask_mod_signature, offset: int):
         return mask_mod(b, h, q + offset, kv)
     return _mask_mod
 
-
 @dataclass
 class TransformerConfig:
-    block_size: int = 1024
+    block_size: int = 2048
     vocab_size: int = 32000
     padded_vocab_size: Optional[int] = None
 
@@ -62,10 +63,13 @@ class TransformerConfig:
     norm_eps: float = 1e-5
     rope_n_elem: Optional[int] = None
 
+    # optional
+    use_fused_ops: bool = False
+    use_qk_norm: bool = False
+
     def __post_init__(self):
         if self.n_local_heads == -1:
             self.n_local_heads = self.n_head
-
         if self.intermediate_size is None:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
@@ -85,8 +89,14 @@ class Transformer(nn.Module):
 
         self.wte = nn.Embedding(config.padded_vocab_size, config.dim)
         self.layers = nn.ModuleList(TransformerBlock(config, layer_idx=i) for i in range(config.n_layer))
-        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        if self.config.use_fused_ops:
+            self.norm = LigerRMSNorm(config.dim, eps=config.norm_eps)
+        else:
+            self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.padded_vocab_size, bias=False)
+
+        if self.config.use_fused_ops:
+            self.fused_linear_cross_entropy = LigerFusedLinearCrossEntropyLoss(ignore_index=-100)
         
         # initialize weights
         self.apply(lambda m: _init_weights(m, self.config.n_layer, self.config.dim))
@@ -117,6 +127,7 @@ class Transformer(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor, 
+        labels: Optional[torch.LongTensor] = None, 
         input_pos: Optional[Tensor] = None, 
         mask: Optional[BlockMask] = None
     ) -> Tensor:
@@ -138,6 +149,17 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x, cos, sin, mask=mask, input_pos=input_pos)
         x = self.norm(x)
+
+        if labels is not None:
+            if self.config.use_fused_ops:
+                loss = self.fused_linear_cross_entropy(
+                    self.output.weight, x.view(-1, x.size(-1)), labels.view(-1)
+                ) # need to reshape to x to (B*N, D) and labels to (B*N)
+                return loss
+            else:
+                logits = self.output(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
+                return loss
         
         logits = self.output(x)
         return logits
@@ -149,10 +171,18 @@ class TransformerBlock(nn.Module):
         self.config = config
 
         self.attention = Attention(config, layer_idx)
-        self.feed_forward = LLaMAMLP(config)
-        
-        self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
+
+        if config.use_fused_ops:
+            self.feed_forward = LigerSwiGLUMLP(config)
+        else:
+            self.feed_forward = LLaMAMLP(config)
+
+        if self.config.use_fused_ops:
+            self.ffn_norm = LigerRMSNorm(config.dim, eps=config.norm_eps)
+            self.attention_norm = LigerRMSNorm(config.dim, eps=config.norm_eps)
+        else:
+            self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
+            self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor, is_causal: Optional[bool] = True, mask: Optional[BlockMask] = None, input_pos: Optional[Tensor] = None) -> Tensor:
         h = x + self.attention(self.attention_norm(x), cos, sin, is_causal, mask=mask, input_pos=input_pos)
@@ -183,6 +213,14 @@ class Attention(nn.Module):
 
         self.kv_cache: Optional[KVCache] = None
 
+        if self.config.use_qk_norm:
+            if self.config.use_fused_ops:
+                self.q_norm = LigerRMSNorm(config.head_dim, eps=config.norm_eps)
+                self.k_norm = LigerRMSNorm(config.head_dim, eps=config.norm_eps)
+            else:
+                self.q_norm = RMSNorm(config.head_dim, eps=config.norm_eps)
+                self.k_norm = RMSNorm(config.head_dim, eps=config.norm_eps)
+
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor, is_causal: Optional[bool] = True, mask: Optional[BlockMask] = None, input_pos: Optional[Tensor] = None) -> Tensor:
         
         bsz, seqlen, _ = x.shape
@@ -194,12 +232,19 @@ class Attention(nn.Module):
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
+        if self.config.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
-        q = apply_rope_emb(q, cos, sin, self.rope_n_elem) # (B, n_head, N, head_dim)
-        k = apply_rope_emb(k, cos, sin, self.rope_n_elem) # (B, n_local_heads, N, head_dim)
+        if self.config.use_fused_ops:
+            q, k = liger_rotary_pos_emb(q, k, cos, sin)
+        else:
+            q = apply_rope_emb(q, cos, sin, self.rope_n_elem) # (B, n_head, N, head_dim)
+            k = apply_rope_emb(k, cos, sin, self.rope_n_elem) # (B, n_local_heads, N, head_dim)
 
-        if self.kv_cache is not None:
+        if self.kv_cache is not None and input_pos is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
         if mask is None:
@@ -222,7 +267,6 @@ class Attention(nn.Module):
         # Output projection
         return y
 
-
 # https://github.com/Lightning-AI/litgpt/blob/048633a7d08f75280e1f02fcd0ba58a7e47dfeb1/litgpt/model.py#L531
 class LLaMAMLP(nn.Module):
     def __init__(self, config: TransformerConfig) -> None:
@@ -237,6 +281,18 @@ class LLaMAMLP(nn.Module):
         x_fc_2 = self.fc_2(x)
         x = F.silu(x_fc_1) * x_fc_2
         return self.proj(x)
+
+
+class LigerSwiGLUMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.fc_1 = nn.Linear(config.dim, config.intermediate_size, bias=False)
+        self.fc_2 = nn.Linear(config.dim, config.intermediate_size, bias=False)
+        self.proj = nn.Linear(config.intermediate_size, config.dim, bias=False)
+
+    def forward(self, x):
+        return self.proj(LigerSiLUMulFunction.apply(self.fc_1(x), self.fc_2(x)))
 
 
 # https://github.com/Lightning-AI/litgpt/blob/048633a7d08f75280e1f02fcd0ba58a7e47dfeb1/litgpt/model.py#L812
@@ -308,7 +364,7 @@ def _init_weights(module: nn.Module, n_layer: int, dim: int) -> None:
 
     # GPT-NeoX
     for name, p in module.named_parameters():
-        if (name == "wo.weight" and isinstance(module, Attention)) or (name == "proj.weight" and (isinstance(module, LLaMAMLP))):
+        if (name == "wo.weight" and isinstance(module, Attention)) or (name == "proj.weight" and (isinstance(module, LLaMAMLP) or isinstance(module, LigerSwiGLUMLP))):
             nn.init.normal_(p, mean=0.0, std=(1 / math.sqrt(dim) / n_layer))
 
 
@@ -432,13 +488,17 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    config = TransformerConfig()
-    print(config)
+    config = TransformerConfig(
+        block_size=2048,
+        n_layer=12,
 
+        n_head=12,
+        dim=768,
+        # use_fused_ops=True,
+    )
     model = Transformer(config)
-    model.setup_cache(device=device)
     model.to(device)
-    print(model)
+    model.setup_cache(device=device) # setup RoPE cache
 
     input_ids = torch.randint(0, config.vocab_size, (1, config.block_size), device=device)
     print("input_ids.shape:", input_ids.shape, input_ids.dtype)
