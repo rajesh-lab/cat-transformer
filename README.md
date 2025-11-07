@@ -14,7 +14,7 @@ This repository provides hackable, scalable and efficient pure PyTorch implement
 - CATs model _chunks of tokens_ given compressed representations of past chunks in the sequence 😸.
 <!-- ![alt text](assets/cat_diagram.png) -->
 <p align="center">
-  <img src="assets/cat_diagram.png" alt="cat_diagram" width="50%">
+  <img src="assets/cat_diagram.png" alt="cat_diagram" width="35%">
 </p>
 
 - CATs demonstrate one needs **only two simple ingredients** (dense attention and compression) to design a **simple**, **efficient** and importantly, an **adaptive** architecture. No need to heuristically define sparse attention masks; no need for handcrafted and complex recurrent state update rules; no need to carefully compose with attention at specific layers to have a capable architecture 💆‍♀️😌. (The troubled cat 😿 below describes the overwhelming feeling of designing an efficient architecture)
