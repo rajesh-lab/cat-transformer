@@ -36,6 +36,17 @@ def get_cat_mask(block_size: int):
     
     return cat_mask
 
+# some helpers
+def power_of_2(x: int) -> int:
+    # 2^(x % iter_num)
+    return int(2 ** x)
+
+def power_of_2_exponent(n: int) -> int:
+    if n <= 0:
+        raise ValueError("Input must be a positive integer.")
+    if (n & (n - 1)) != 0:
+        raise ValueError(f"{n} is not a power of 2.")
+    return int(math.log2(n))
 
 @dataclass
 class CAT_Config(TransformerConfig):
@@ -45,9 +56,6 @@ class CAT_Config(TransformerConfig):
     # compressor will compress to this dimension
     dim_fx: Optional[int] = None
 
-    # how many chunk sizes to train on
-    adaptive_steps: Optional[int] = None
-
     def __post_init__(self):
         super().__post_init__()
         
@@ -56,8 +64,6 @@ class CAT_Config(TransformerConfig):
 
         if self.dim_fx is None:
             self.dim_fx = self.dim
-
-        assert self.adaptive_steps is not None
 
 
 class Compressor(nn.Module):
@@ -103,7 +109,7 @@ class Compressor(nn.Module):
         # input_ids: (bsz, chunk_size)
         # chunk_idx: (1)
         bsz, seqlen = input_ids.shape
-        assert seqlen == self.chunk_size
+        # assert seqlen == self.chunk_size # can't assert anymore :)
 
         x = self.wte(input_ids) # (bsz, chunk_size, dim)
 
@@ -115,7 +121,7 @@ class Compressor(nn.Module):
         pos_token = self.pos_tokens(chunk_idx) # (dim)
         pos_token = einops.repeat(pos_token, 'd -> b 1 d', b=bsz) # (bsz, 1, dim)
 
-        # adaptive_token tells compressor which chunk size the decoder and compressor is using
+        # adaptive_token tells compressor which chunk size is being used
         adaptive_token = self.adaptive_token(chunk_size_power) # (dim)
         adaptive_token = einops.repeat(adaptive_token, 'd -> b 1 d', b=bsz) # (bsz, 1, dim)
 
@@ -145,6 +151,8 @@ class CAT_Transformer(nn.Module):
         super().__init__()
         self.config = config
 
+        self.power_of_2_exponent = power_of_2_exponent(self.config.chunk_size)
+
         self.num_chunks = config.num_chunks
         self.chunk_size = config.chunk_size
         self.block_size = config.block_size
@@ -153,10 +161,20 @@ class CAT_Transformer(nn.Module):
         self.f = Compressor(f_config)
 
         # decoder params
-        self.dummy_fx = nn.Embedding(1, config.dim)
+        # this also acts as the token which tells decoder the chunk size being used
+        self.dummy_fx = nn.Embedding(self.power_of_2_exponent + 1, config.dim) 
         self.wte = nn.Embedding(config.padded_vocab_size, config.dim)
         self.layers = nn.ModuleList(TransformerBlock(config, layer_idx=i) for i in range(config.n_layer))
         self.output = nn.Linear(config.dim, config.padded_vocab_size, bias=False)
+
+        # seperates the chunk representations and the token embeddings
+        self.seperator = nn.Embedding(1, config.dim)
+
+        # declare these early
+        self.cos = dict()
+        self.sin = dict()
+        self.cos_gen = None
+        self.sin_gen = None
 
         # fused rmsnorm
         if self.config.use_fused_ops:
@@ -187,36 +205,52 @@ class CAT_Transformer(nn.Module):
 
     def setup_cache(self, device: torch.device):
 
-        self.f.setup_cache(device=device) # called for the encoder/compressor
+        self.f.setup_cache(device=device) # called for the compressor
+        print("power_of_2_exponent:", self.power_of_2_exponent)
 
-        # first, cache below for doing generation
-        _cos, _sin = build_rope_cache(
-            self.block_size, # JP: declare more than necessary here, its okay.
-            self.config.rope_n_elem, device=device, base=self.config.rope_base
-        )
-        self.register_buffer("cos_gen", _cos, persistent=False)
-        self.register_buffer("sin_gen", _sin, persistent=False)
+        for c in range(1 + self.power_of_2_exponent):
 
-        cos, sin = build_rope_cache(1 + self.chunk_size, self.config.rope_n_elem, device=device, base=self.config.rope_base)
-        # careful here!
-        cos = einops.repeat(cos, '1 l d -> 1 k l d', k=self.num_chunks+1).clone()
-        sin = einops.repeat(sin, '1 l d -> 1 k l d', k=self.num_chunks+1).clone()
+            chunk_size = int(2 ** c)
+            print("creating cos and sin cache for chunk size:", chunk_size)
 
-        cos = einops.rearrange(cos, '1 k l d -> 1 (k l) d')
-        sin = einops.rearrange(sin, '1 k l d -> 1 (k l) d')
+            assert self.block_size % chunk_size == 0
+            num_chunks = (self.block_size // chunk_size)
 
-        # careful!
-        # trim off extra
-        cos = cos[:, :self.block_size + self.num_chunks + 1, :].contiguous()
-        sin = sin[:, :self.block_size + self.num_chunks + 1, :].contiguous()
+            _cos, _sin = build_rope_cache(
+                num_chunks + chunk_size + 2, # this is okay
+                self.config.rope_n_elem, 
+                device=device,
+                base=self.config.rope_base
+            )
+            if c == self.power_of_2_exponent:
+                # this is the max chunk size
+                # we need to cache these for doing generation
+                self.cos_gen = _cos.clone()
+                self.sin_gen = _sin.clone()
 
-        # cache these for training
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+            cos, sin = build_rope_cache(
+                2 + chunk_size,
+                
+                self.config.rope_n_elem, 
+                device=device,
+                base=self.config.rope_base
+            )
+            cos = einops.repeat(cos, '1 l d -> 1 k l d', k=num_chunks+1).clone()
+            sin = einops.repeat(sin, '1 l d -> 1 k l d', k=num_chunks+1).clone()
 
-        print("created cos and sin cache for CAT ...")
-        print("cos shape:", self.cos.shape)
-        print("cos dtype:", self.cos.dtype)
+            cos = einops.rearrange(cos, '1 k l d -> 1 (k l) d').clone()
+            sin = einops.rearrange(sin, '1 k l d -> 1 (k l) d').clone()
+
+            cos = cos[:, :self.block_size + 2*num_chunks + 2, :].clone()
+            sin = sin[:, :self.block_size + 2*num_chunks + 2, :].clone()
+
+            # cache for training
+            self.cos[c] = cos.clone()
+            self.sin[c] = sin.clone()
+
+            print("created cos and sin cache for chunked decoder ...")
+            print("cos shape:", self.cos[c].shape)
+            print("cos dtype:", self.cos[c].dtype)
 
 
     # used for generation
@@ -229,46 +263,19 @@ class CAT_Transformer(nn.Module):
                 self.config.n_local_heads, self.config.head_dim, dtype, device
             )
 
-    # used for generation!
-    def forward_embeddings(self, x: Tensor, cos: Optional[torch.Tensor] = None, sin: Optional[torch.Tensor] = None, input_pos: Optional[Tensor] = None, rope_pos: Optional[Tensor] = None, mask: Optional[BlockMask] = None, is_input_token=False) -> Tensor:
-        # x: (B, l, D)
-        bsz, seqlen = x.shape[0:2]
-        assert seqlen <= self.chunk_size + self.num_chunks
 
-        if mask is not None and input_pos is not None:
-            # doing generation
-            mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
-
-        if is_input_token:
-            x = self.wte(x) # (B, l, D)
-
-        if cos is None and sin is None: # if cos and sin are not provided, use the cached ones
-            cos, sin = self.cos_gen, self.sin_gen
-
-        if input_pos is not None:
-            cos_gen = cos[:, rope_pos]
-            sin_gen = sin[:, rope_pos]
-        else:
-            cos_gen = cos[:, :seqlen, :]
-            sin_gen = sin[:, :seqlen, :]
-
-        for layer in self.layers:
-            x = layer(x, cos_gen, sin_gen, input_pos=input_pos, mask=mask)
-        x = self.norm(x)
-
-        logits = self.output(x)
-        return logits
-
-
-    def forward(self, input_ids: torch.LongTensor, labels: Optional[torch.LongTensor] = None) -> Tensor:
+    def forward(self, input_ids: torch.LongTensor, labels: Optional[torch.LongTensor] = None, chunk_size_power: Optional[int] = None) -> Tensor:
         # input_ids: (B, L)
         bsz, seqlen = input_ids.shape
 
+        assert chunk_size_power is not None
+        cur_iter_chunk_size = power_of_2(chunk_size_power)
+
         # handle non-multiple of chunk_size seqlen by padding
         slice_end = False
-        if seqlen % self.chunk_size != 0:
+        if seqlen % cur_iter_chunk_size != 0:
             # pad to the next multiple of chunk_size
-            new_seqlen = ((seqlen // self.chunk_size) + 1) * self.chunk_size
+            new_seqlen = ((seqlen // cur_iter_chunk_size) + 1) * cur_iter_chunk_size
             pad_len = new_seqlen - seqlen
             # padding with zero (which is usually the pad token)
             # JP: replace with appropriate pad token of tokenizer
@@ -277,52 +284,58 @@ class CAT_Transformer(nn.Module):
             seqlen = new_seqlen
             slice_end = True
 
-        cur_num_chunks = seqlen // self.chunk_size
+        cur_num_chunks = seqlen // cur_iter_chunk_size
 
-        input_ids = input_ids.view(bsz, cur_num_chunks, self.chunk_size) # (B, K, l)
+        input_ids = input_ids.view(bsz, cur_num_chunks, cur_iter_chunk_size) # (B, K, l)
 
         # compress all chunks in parallel
-        fx = torch.vmap(self.f.compress, in_dims=(1, 0), out_dims=1)(
+        fx = torch.vmap(self.f.compress, in_dims=(1, 0, None), out_dims=1)(
             input_ids, # (B, K, l)
-            torch.arange(cur_num_chunks, device=input_ids.device) # (K)
+            torch.arange(cur_num_chunks, device=input_ids.device), # (K)
+            torch.tensor(chunk_size_power, device=input_ids.device, dtype=torch.long) # (K)
         ) # (B, K, D_fx)
         fx = self.down_proj(fx) # (B, K, D_fx) -> (B, K, D)
         fx_last = fx[:, -1, :].unsqueeze(1) # (B, 1, D)
 
-        dummy_fx = self.dummy_fx(torch.zeros(1, device=input_ids.device, dtype=torch.long)) # (1, D)
+        # attach the conditioning vector, which is dummy_fx
+        # this tells the decoder which chunk size is being used
+        dummy_fx = self.dummy_fx(torch.tensor([chunk_size_power], device=input_ids.device, dtype=torch.long)) # (1, D) # this is now the conditioning vector
         dummy_fx = einops.repeat(dummy_fx, '1 d -> b 1 d', b=bsz) # (B, 1, D)
 
-        # directly pass the fx to the decoder
         fx = torch.cat([dummy_fx, fx[:, :-1, :]], dim=1) # concat{ (B, 1, D), (B, K-1, D) } = (B, K, D)
         fx = einops.rearrange(fx, 'b k d -> b k 1 d') # (B, K, 1, D)
 
+        # create seperator tokens
+        # these seperate the chunk representations and the token embeddings in decoder
+        sep_token = self.seperator(torch.zeros(1, device=input_ids.device, dtype=torch.long)) # (1, D)
+        sep_token = einops.repeat(sep_token, '1 d -> b k 1 d', b=bsz, k=cur_num_chunks) # (B, K, 1, D)
+        last_sep_token = self.seperator(torch.zeros(1, device=input_ids.device, dtype=torch.long)) # (1, D)
+        last_sep_token = einops.repeat(last_sep_token, '1 d -> b 1 d', b=bsz) # (B, 1, D)
+
         emb_x = self.wte(input_ids) # (B, K, l, D)
-        x = torch.cat([fx, emb_x], dim=2) # (B, K, 1+l, D)
+        x = torch.cat([fx, sep_token, emb_x], dim=2) # (B, K, 2+l, D)
         x = einops.rearrange(x, 'b k l d -> b (k l) d') # (B, K + L, D) # flatten the chunks
-        x = torch.cat([x, fx_last], dim=1) # (B, K + L + 1, D) # add the last chunk's representation
+        x = torch.cat([x, fx_last, last_sep_token], dim=1) # (B, K + L + 2, D) # add the last chunk's representation
 
-        # trim off extra cos and sin
-        cos = self.cos[:, :x.shape[1], :]
-        sin = self.sin[:, :x.shape[1], :]
+        cos = self.cos[chunk_size_power][:, :x.shape[1], :]
+        sin = self.sin[chunk_size_power][:, :x.shape[1], :]
 
-        # create mask for this input size
         mask = create_block_mask(
-            get_cat_mask(1 + self.chunk_size),
+            get_cat_mask(1 + 1 + cur_iter_chunk_size),
             B=None, H=None,
             Q_LEN=x.shape[1], # K+L
             KV_LEN=x.shape[1], # K+L
         )
 
         for layer in self.layers:
-            # pass through cat with masking
-            x = layer(x, cos=cos, sin=sin, mask=mask)
+            x = layer(x, cos, sin, mask=mask)
         x = self.norm(x)
 
         # Arrange everything nicely back to (B, L, D) for next token prediction
         x_last = x[:, -1:, :].contiguous() # (B, 1, D)
-        x = einops.rearrange(x[:, :-1, :], 'b (k l) d -> b k l d', k=cur_num_chunks, l=self.chunk_size+1) # (B, K, 1+l, D)
-        x_first = x[:, :1, 1:-1, :].contiguous() # (B, 1, l-1, D)
-        x_middle = x[:, 1:, :-1, :].contiguous() # (B, K-1, l, D)
+        x = einops.rearrange(x[:, :-2, :], 'b (k l) d -> b k l d', k=cur_num_chunks, l=cur_iter_chunk_size+2) # (B, K, 2+l, D)
+        x_first = x[:, :1, 2:-1, :].contiguous() # (B, 1, l-1, D)
+        x_middle = x[:, 1:, 1:-1, :].contiguous() # (B, K-1, l, D)
         x_first = einops.rearrange(x_first, 'b 1 l d -> b (1 l) d') # (B, l-1, D)
         x_middle = einops.rearrange(x_middle, 'b k l d -> b (k l) d') # (B, (K-1)*l, D)
         x = torch.cat([x_first, x_middle, x_last], dim=1) # (B, (K-1)*l + l-1 + 1, D) = (B, K*l, D) = (B, L, D)
@@ -353,7 +366,7 @@ if __name__ == "__main__":
     # below assumes that one wishes to instantiate a CAT that matches
     # a vanilla transformer containing 12 layers, and hidden size of 768
     dim = 768
-    num_layers = 12
+    num_layers = 4
     n_head = 12
 
     # this is the hidden size of decoder, which is recommended to be 2*dim
@@ -365,7 +378,7 @@ if __name__ == "__main__":
     n_head_decoder = 2 * n_head # increase heads too proportionally
 
     block_size = 2048 # context length
-    chunk_size = 8 # chunk size
+    chunk_size = 32 # chunk size
 
     # instantiate the model
     compressor_config = CAT_Config(dim=dim, n_head=n_head, dim_fx=dim_fx, block_size=block_size, chunk_size=chunk_size, n_layer=(num_layers // 4)) # layers are defined according to the paper, but one may use lower number of layers in the compressor
@@ -378,6 +391,12 @@ if __name__ == "__main__":
     input_ids = torch.randint(0, decoder_config.vocab_size, (4, block_size), device=device)
     print("input_ids shape:", input_ids.shape)
 
-    logits = model(input_ids)
+    # choose which chunk size to use for this forward pass
+    # must be power of 2, and and less than or equal to chunk_size
+    # only powers of two supported for now
+    cur_chunk_size_power = 4 # corresponds to chunk size of 16 (2^4)
+
+    logits = model(input_ids, chunk_size_power=cur_chunk_size_power)
+
     print("logits shape:", logits.shape)
     # do stuff with logits ...
