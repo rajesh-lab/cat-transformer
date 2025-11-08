@@ -45,6 +45,9 @@ class CAT_Config(TransformerConfig):
     # compressor will compress to this dimension
     dim_fx: Optional[int] = None
 
+    # how many chunk sizes to train on
+    adaptive_steps: Optional[int] = None
+
     def __post_init__(self):
         super().__post_init__()
         
@@ -53,6 +56,8 @@ class CAT_Config(TransformerConfig):
 
         if self.dim_fx is None:
             self.dim_fx = self.dim
+
+        assert self.adaptive_steps is not None
 
 
 class Compressor(nn.Module):
@@ -65,7 +70,10 @@ class Compressor(nn.Module):
         self.block_size = config.block_size
 
         self.wte = nn.Embedding(config.padded_vocab_size, config.dim)
-        self.pos_tokens = nn.Embedding(config.num_chunks, config.dim)
+        self.pos_tokens = nn.Embedding(self.block_size, config.dim) # this can have block_size tokens now
+
+        self.power_of_two = int(math.log2(self.chunk_size))
+        self.adaptive_token = nn.Embedding(self.power_of_two + 1, config.dim) # (1, dim)
 
         self.layers = nn.ModuleList(TransformerBlock(config, layer_idx=i) for i in range(config.n_layer))
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
@@ -78,7 +86,7 @@ class Compressor(nn.Module):
     def setup_cache(self, device=None):
 
         cos, sin = build_rope_cache(
-            1 + self.chunk_size, # +1 for the position token
+            2 + self.chunk_size, # +1 for the position and adaptive token
             self.config.rope_n_elem, 
             device=device, 
             base=self.config.rope_base
@@ -91,7 +99,7 @@ class Compressor(nn.Module):
         print("cos shape:", self.cos.shape)
         print("cos dtype:", self.cos.dtype)
 
-    def compress(self, input_ids: torch.LongTensor, chunk_idx: torch.LongTensor) -> Tensor:
+    def compress(self, input_ids: torch.LongTensor, chunk_idx: torch.LongTensor, chunk_size_power: torch.LongTensor) -> Tensor:
         # input_ids: (bsz, chunk_size)
         # chunk_idx: (1)
         bsz, seqlen = input_ids.shape
@@ -99,17 +107,35 @@ class Compressor(nn.Module):
 
         x = self.wte(input_ids) # (bsz, chunk_size, dim)
 
+        # trim cos, sin
+        cos = self.cos[:, :2 + seqlen] # due to adptive
+        sin = self.sin[:, :2 + seqlen]
+
+        # pos_token tells the compressor which position this chunk is in the sequence
         pos_token = self.pos_tokens(chunk_idx) # (dim)
         pos_token = einops.repeat(pos_token, 'd -> b 1 d', b=bsz) # (bsz, 1, dim)
-        x = torch.cat([pos_token, x], dim=1) # (bsz, 1 + chunk_size, dim)
+
+        # adaptive_token tells compressor which chunk size the decoder and compressor is using
+        adaptive_token = self.adaptive_token(chunk_size_power) # (dim)
+        adaptive_token = einops.repeat(adaptive_token, 'd -> b 1 d', b=bsz) # (bsz, 1, dim)
+
+        x = torch.cat([adaptive_token, pos_token, x], dim=1) # (bsz, 1 + chunk_size, dim)
 
         for layer in self.layers:
-            x = layer(x, self.cos, self.sin, is_causal=self.is_causal)
+            x = layer(x, cos, sin, is_causal=self.is_causal)
         x = self.norm(x) # (bsz, chunk_size + 1, dim)
 
-        x = x[:, 1:, :] # (bsz, chunk_size, dim) # remove the position token
+        x = x[:, 2:, :] # (bsz, chunk_size, dim) # remove the position token
         x = einops.rearrange(x, 'b l d -> b (l d)') # (bsz, chunk_size * dim)
-        x = self.proj_fx(x) # (bsz, chunk_size * dim) -> (bsz, dim)
+
+        # below is inspired from: https://arxiv.org/abs/2212.08013
+        # reshape proj_fx to adapt to different chunk sizes
+        new_proj_fx_weight = torch.nn.functional.interpolate(
+            self.proj_fx.weight.unsqueeze(0).unsqueeze(0), # (1, 1, out_features, in_features)
+            size=(self.config.dim_fx, (2 ** chunk_size_power) * self.config.dim), # (out_features, in_features)
+            mode="bilinear"
+        ).squeeze(0).squeeze(0) # (out_features, in_features)
+        x = torch.nn.functional.linear(x, new_proj_fx_weight, bias=None) # (bsz, dim_fx)
 
         return x
 
