@@ -328,6 +328,7 @@ if __name__ == "__main__":
     # a vanilla transformer containing 12 layers, and hidden size of 768
     dim = 768
     num_layers = 12
+    n_head = 12
 
     # this is the hidden size of decoder, which is recommended to be 2*dim
     # however, it can be 1.5*dim, or 1.25*dim depending on the task
@@ -335,13 +336,14 @@ if __name__ == "__main__":
     # is same as hidden size of the decoder
     decoder_dim = 2 * dim # hidden size of the decoder
     dim_fx = decoder_dim # size of compressed chunk representations
+    n_head_decoder = 2 * n_head # increase heads too proportionally
 
     block_size = 2048 # context length
     chunk_size = 8 # chunk size
 
     # instantiate the model
-    compressor_config = CAT_Config(dim=dim, dim_fx=dim_fx, block_size=block_size, chunk_size=chunk_size, n_layer=(num_layers // 4)) # layers are defined according to the paper, but one may use lower number of layers in the compressor
-    decoder_config = CAT_Config(dim=decoder_dim, block_size=block_size, chunk_size=chunk_size, n_layer=num_layers)
+    compressor_config = CAT_Config(dim=dim, n_head=n_head, dim_fx=dim_fx, block_size=block_size, chunk_size=chunk_size, n_layer=(num_layers // 4)) # layers are defined according to the paper, but one may use lower number of layers in the compressor
+    decoder_config = CAT_Config(dim=decoder_dim, n_head=n_head_decoder, block_size=block_size, chunk_size=chunk_size, n_layer=num_layers)
     model = CAT_Transformer(decoder_config, compressor_config)
     model = model.to(device=device)
     model.setup_cache(device=device)

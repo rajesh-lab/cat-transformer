@@ -47,6 +47,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # below assumes that one wishes to instantiate a CAT that matches
 # a vanilla transformer containing 12 layers, and hidden size of 768
 dim = 768
+n_head = 12
 num_layers = 12
 
 # this is the hidden size of decoder, which is recommended to be 2*dim
@@ -55,17 +56,17 @@ num_layers = 12
 # is same as hidden size of the decoder
 decoder_dim = 2 * dim # hidden size of the decoder
 dim_fx = decoder_dim # size of compressed chunk representations
+n_head_decoder = 2 * n_head # increase heads too proportionally
 
 block_size = 2048 # context length
 chunk_size = 8 # chunk size
 
 # instantiate the model
-compressor_config = CAT_Config(dim=dim, dim_fx=dim_fx, block_size=block_size, chunk_size=chunk_size, n_layer=(num_layers // 4)) # layers are defined according to the paper, but one may use lower number of layers in the compressor
-decoder_config = CAT_Config(dim=decoder_dim, block_size=block_size, chunk_size=chunk_size, n_layer=num_layers)
+compressor_config = CAT_Config(dim=dim, n_head=n_head, dim_fx=dim_fx, block_size=block_size, chunk_size=chunk_size, n_layer=(num_layers // 4)) # layers are defined according to the paper, but one may use lower number of layers in the compressor
+decoder_config = CAT_Config(dim=decoder_dim, n_head=n_head_decoder, block_size=block_size, chunk_size=chunk_size, n_layer=num_layers)
 model = CAT_Transformer(decoder_config, compressor_config)
 model = model.to(device=device)
 model.setup_cache(device=device)
-print(model)
 
 # do forward pass
 input_ids = torch.randint(0, decoder_config.vocab_size, (4, block_size), device=device)
