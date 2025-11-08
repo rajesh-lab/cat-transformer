@@ -5,6 +5,8 @@
 <div align="center">
 
 # Compress And Attend Transformers (CATs)
+
+This repository provides single-file hackable, scalable and efficient 🚀 _pure_ PyTorch implementation for CATs.
 </div>
 
 > [**Attention and Compression is all you need for Controllably Efficient Language Models**](https://arxiv.org/abs)<br>
@@ -24,10 +26,8 @@
 - can be used as a drop-in replacement for dense attention layers in any transformer-based architecture to create controllably efficient architectures.
 
 <p align="center">
-  <img src="assets/cat_diagram.png" alt="cat_diagram" width="35%">
+  <img src="assets/cat_diagram.png" alt="cat_diagram" width="75%">
 </p>
-
-This repository provides hackable, scalable and efficient 🚀 pure PyTorch implementation for CATs.
 
 <!-- <p align="center">
   <img src="assets/trade_offs.png" alt="trade_offs" width="75%">
@@ -132,6 +132,14 @@ x = torch.randint(0, config.padded_vocab_size, (batch_size, seq_len), device=dev
 logits = model(x)
 
 # do stuff with logits ...
+```
+
+## Installation
+Here are the packages that we used to run our code:
+
+```bash
+torch==2.5.1+cu121
+liger-kernel
 ```
 
 ## Acknowledgements
