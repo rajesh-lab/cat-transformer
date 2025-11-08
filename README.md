@@ -74,6 +74,9 @@ logits = model(input_ids)
 # do stuff with logits ...
 ```
 
+### Benchmark CATs
+Refer to `benchmark.py` to measure generation throughput and memory usage of CATs.
+
 ### Usage for CAT as a drop-in layer
 
 Refer to `cat_layer.py`
