@@ -9,7 +9,7 @@
 This repository provides single-file hackable, scalable and efficient 🚀 _pure_ PyTorch implementation for CATs.
 </div>
 
-> [**Attention and Compression is all you need for Controllably Efficient Language Models**](https://arxiv.org/abs)<br>
+> [**Attention and Compression is all you need for Controllably Efficient Language Models**](https://arxiv.org/abs/2511.05313)<br>
 > [Jatin Prakash](https://bicycleman15.github.io), [Aahlad Puli](https://aahladmanas.github.io), [Rajesh Ranganath](https://rajesh-lab.github.io)
 > <br>New York University<br>
 
