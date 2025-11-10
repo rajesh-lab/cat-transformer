@@ -16,7 +16,7 @@ This repository provides single-file hackable, scalable and efficient 🚀 _pure
 <div align="center">
 
 [![Static Badge](https://img.shields.io/badge/Paper-arXiv-darkred)](https://arxiv.org/abs/2511.05313)
-[![Twitter](https://img.shields.io/twitter/url/https/twitter.com/cloudposse.svg?style=social&label=tweet)](https://x.com/bicycleman15/status/)
+[![Twitter](https://img.shields.io/twitter/url/https/twitter.com/cloudposse.svg?style=social&label=tweet)](https://x.com/bicycleman15/status/1987895472409673972)
 
 </div>
 
@@ -53,6 +53,8 @@ This repository provides single-file hackable, scalable and efficient 🚀 _pure
 - We take the core concepts and instantiate CAT as a layer which can be swapped in any sequence model as a **drop-in replacement**, replacing dense attention. This can unlock lots of interesting possibilities starting with creating hybrid as well as adaptive architectures that mixes CAT layers alongside dense attention, or perhaps even linear attention.
 
 ## Usage
+
+> ⚠️ We will be releasing our pre-trained CAT models soon! 🙂
 
 Here are some things to keep in mind:
 - `transformer.py` contains a fast implementation for transformer++. Highly inspired from the `Lightning-AI/litgpt` repo. To make this implementation efficient, it uses triton kernels from `linkedin/Liger-Kernel` repo. CAT's implementation directly imports components from here since it builds on vanilla transformer abstractions.
