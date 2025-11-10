@@ -15,7 +15,7 @@ This repository provides single-file hackable, scalable and efficient 🚀 _pure
 
 <div align="center">
 
-[![Static Badge](https://img.shields.io/badge/Paper-arXiv-darkred)](https://arxiv.org/abs/xxx)
+[![Static Badge](https://img.shields.io/badge/Paper-arXiv-darkred)](https://arxiv.org/abs/2511.05313)
 [![Twitter](https://img.shields.io/twitter/url/https/twitter.com/cloudposse.svg?style=social&label=tweet)](https://x.com/bicycleman15/status/)
 
 </div>
