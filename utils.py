@@ -94,14 +94,15 @@ def get_model(accelerate: Accelerator, cfg):
 
 # https://github.com/Lightning-AI/litgpt/blob/main/litgpt/pretrain.py#L384
 @torch.no_grad()
-def validate(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.utils.data.DataLoader, cfg) -> torch.Tensor:
+def validate(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.utils.data.DataLoader, cfg):
     
     print("Validating ...")
     model.eval()
 
     max_iters = cfg.eval.eval_iters
 
-    losses = []
+    total_loss = 0.0
+    total_tokens = 0
     val_bar = tqdm(enumerate(val_dataloader), total=len(val_dataloader), desc="Evaluating", disable=(not accelerate.is_main_process))
     for k, batch in val_bar:
         input_ids, targets = batch
@@ -111,15 +112,19 @@ def validate(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.ut
 
         input_ids, targets = input_ids.to(accelerate.device), targets.to(accelerate.device)
         
+        num_tokens = (targets != -100).sum().item()
+
         with accelerate.autocast():
             loss = model(input_ids, targets)
 
-        losses.append(loss)
-        val_bar.set_postfix_str(f"val loss: {(sum(losses) / len(losses)):.4f}")
+        total_loss += loss.item() * num_tokens
+        total_tokens += num_tokens
+        val_bar.set_postfix_str(f"val loss: {total_loss / total_tokens:.4f}")
 
-    val_loss = torch.stack(losses).mean()
+    val_loss = total_loss / total_tokens
+    perplexity = math.exp(val_loss)
     model.train()
-    return val_loss
+    return val_loss, perplexity
 
 
 # taken from: https://github.com/Lightning-AI/litgpt/blob/main/litgpt/pretrain.py#L299

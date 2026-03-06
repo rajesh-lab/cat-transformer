@@ -58,18 +58,12 @@ def main(cfg: DictConfig):
         # Initialize wandb
         wandb.init(
             project=cfg.wandb.project, 
-            name=cfg.wandb.exp_name,
+            name=experiment_name,
             dir=result_dir, # save in seperate wandb dir
             config=OmegaConf.to_container(cfg, resolve=True)
         )
         wandb.define_metric("val_loss", summary="min")
         wandb.define_metric("end_val_loss", summary="min")
-
-        wandb.define_metric("iteration")
-        wandb.define_metric("val/*", step_metric="iteration")
-        wandb.define_metric("train/*", step_metric="iteration")
-        wandb.define_metric("track/*", step_metric="iteration")
-        wandb.define_metric("perf/*", step_metric="iteration")
 
         accelerate.print("******* Results Dir *******")
         accelerate.print("Experiment:", experiment_name)
@@ -91,7 +85,7 @@ def main(cfg: DictConfig):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=cfg.train.batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=0,
         pin_memory=True,
         generator=g,
@@ -106,7 +100,7 @@ def main(cfg: DictConfig):
     ) # we don't prepare the val_loader since we test on all processes!
 
     train_dataloader = accelerate.prepare_data_loader(train_dataloader)
-    train_iterator = CycleIterator(train_dataloader, upper=cfg.train.cycle_upper)
+    train_iterator = CycleIterator(train_dataloader)
 
     # get model
     model = get_model(accelerate, cfg)
@@ -129,6 +123,8 @@ def main(cfg: DictConfig):
     accelerate.print(f"\nTrain iters in this training: {cfg.train.train_iters:,}")
     
     accelerate.print(f"\nGradient steps in this training: {cfg.train.train_iters // grad_accum:,}")
+    effective_batch_size_tokens = cfg.train.batch_size * accelerate.num_processes * grad_accum * cfg.model.block_size
+    accelerate.print(f"Effective batch size (tokens): {effective_batch_size_tokens:,}")
     accelerate.print(f"Iterating over tokens: {cfg.train.train_iters * cfg.train.batch_size * accelerate.num_processes * cfg.model.block_size:,}")
 
     if cfg.train.grad_norm > 0:
@@ -166,10 +162,6 @@ def main(cfg: DictConfig):
 
         start_time = time.time()
 
-        wandb.log({
-            "iteration": iter_num
-        })
-
         # Zero gradients only at the start of each accumulation cycle
         if iter_num % grad_accum == 0:
             optimizer.zero_grad()
@@ -181,7 +173,7 @@ def main(cfg: DictConfig):
 
         with accelerate.autocast():
             original_loss = model(input_ids, targets)
-            loss = cfg.train.loss_mult * original_loss / grad_accum  # Normalize loss to account for accumulation
+            loss = original_loss / grad_accum  # Normalize loss to account for accumulation
 
         accelerate.backward(loss)
 
@@ -207,31 +199,20 @@ def main(cfg: DictConfig):
                         "train/grad_scaler": accelerate.scaler.get_scale(),
                     })
 
-                # recompute batch loss after optimizer step
-                model.eval()
-                with torch.no_grad():
-                    with accelerate.autocast():
-                        post_loss = model(input_ids, targets)
-                    wandb.log({
-                        "train/postloss": post_loss.item()
-                    })
-                model.train()
-
-
             if accelerate.mixed_precision == "fp16":
                 bar.set_postfix_str(f"loss: {original_loss.item():.4f}; lr: {lr:.6f}; {token_throughput:.2f}K tokens/s; grad_scaler: {accelerate.scaler.get_scale():.4f};")
             else:
                 bar.set_postfix_str(f"loss: {original_loss.item():.4f}; lr: {lr:.6f}; {token_throughput:.2f}K tokens/s;")
             
 
-        if (iter_num % cfg.eval.eval_interval == 0) :
+        if (iter_num % cfg.eval.eval_interval == 0) and (iter_num > 0) :
             
             accelerate.print("Validating log loss...")
-            val_loss = validate(accelerate, model, test_dataloader, cfg)
-            accelerate.print(f"Validation Loss: {val_loss.item():.4f}")
+            val_loss, val_perplexity = validate(accelerate, model, test_dataloader, cfg)
+            accelerate.print(f"Validation Loss: {val_loss:.4f}")
             wandb.log({
-                "val/loss": val_loss.item(),
-                "val/perplexity": torch.exp(val_loss).item(),
+                "val/loss": val_loss,
+                "val/perplexity": val_perplexity,
             })
 
             if accelerate.is_main_process and (iter_num % cfg.train.save_interval == 0) and (iter_num > 0):
@@ -253,9 +234,15 @@ def main(cfg: DictConfig):
    
     # perform a full validation at the end
     accelerate.print("Validating log loss...")
-    val_loss = validate(accelerate, model, test_dataloader, cfg)
-    accelerate.print(f"Validation: {val_loss.item():.4f}")
-    
+    val_loss, val_perplexity = validate(accelerate, model, test_dataloader, cfg)
+    accelerate.print(f"Validation: {val_loss:.4f}")
+
+    if accelerate.is_main_process:
+        wandb.log({
+            "val/loss": val_loss,
+            "val/perplexity": val_perplexity,
+        })
+
     accelerate.wait_for_everyone()
 
     if accelerate.is_main_process:

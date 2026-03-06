@@ -11,10 +11,12 @@ seed: 42
 
 dataset:
     name: fineweb
-    path: dataset/fineweb-1b
+    path: /scratch/jp7467/cat-transformer/dataset/fineweb-1b
 
     # vocab_size: 32000
     vocab_size: 50257
+
+    tokenizer_name: "gpt2"
 
 results_dir: Results
 
@@ -125,7 +127,6 @@ cat_transformer:
     # compressor
     compressor_dim: 768
     compressor_n_head: 12
-    dim_fx: 768
     compressor_num_layers: 3
 
 

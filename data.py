@@ -36,4 +36,4 @@ def get_dataset(cfg):
     test_dataset = RandomBatchDataset(
         torch.load(os.path.join(cfg.dataset.path, "test.pt"), weights_only=False), cfg.model.block_size
     )
-    return train_dataset, test_dataset, dict(vocab_size=cfg.dataset.vocab_size, tokenizer_name="meta-llama/Llama-2-7b-hf")
+    return train_dataset, test_dataset, dict(vocab_size=cfg.dataset.vocab_size, tokenizer_name=cfg.dataset.tokenizer_name)
