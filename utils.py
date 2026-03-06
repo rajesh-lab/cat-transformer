@@ -232,8 +232,8 @@ def seed_everything(seed):
 def get_experiment_name(cfg, datetime_str, accelerate) -> str:
 
     # start with todays date and time to make sure it is unique
-    name = ""
-    name += f"{datetime_str}"
+    name = cfg.wandb.exp_name
+    name += f" {datetime_str}"
     return name
 
 
