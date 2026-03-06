@@ -1,0 +1,133 @@
+hydra:
+  run:
+    dir: Results/hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# disable hydra logging
+defaults:
+    - _self_
+
+# set the seed for reproducibility
+seed: 42
+
+dataset:
+    name: fineweb
+    path: dataset/fineweb-1b
+
+    # vocab_size: 32000
+    vocab_size: 50257
+
+results_dir: Results
+
+wandb:
+    project: fineweb-15b
+    exp_name: default
+
+################################################################################
+
+# Training-related arguments.
+train:
+
+    # Number of optimizer steps between saving checkpoints
+    save_interval: 1000
+
+    # Number of workers for loading data
+    num_workers: 4
+
+    # Batch size
+    batch_size: 128
+
+    # Micro batch size
+    # micro_batch_size: 128
+
+    # Number of optimizer steps, please modify according to the dataset and batch size
+    train_iters: 20000
+    train_epochs: -1
+
+    # Warmup steps percentage
+    warmup_steps_percentage: 0.1
+
+    # Warm steps. If these are provided, warmup_steps_percentage is ignored.
+    warmup_steps: 1000
+
+    # Gradient clipping
+    grad_norm: 1.0
+
+    # calculate grad norm after some train iters
+    grad_norm_interval: 25
+
+    grad_accum: 1
+
+    norm_eps: 0.00001
+
+    loss_mult: 1.0
+
+    cycle_upper: 999999
+
+# Evaluation-related arguments.
+eval:
+
+    # Number of optimizer steps between testing
+    eval_interval: 2000
+
+    # Iters for testing
+    eval_iters: 100
+
+# Optimizer-related arguments
+optimizer:
+
+    # Learning rate 
+    lr: 8e-4
+
+    # Minimum learning rate
+    min_lr: 8e-5
+
+    # Weight decay
+    weight_decay: 0.1
+
+    # Betas (beta1, beta2)
+    betas: [0.9, 0.95]
+
+# results directory
+# don't change this, it will be set by the script
+result_dir:
+
+# choose from [transformer, cat_transformer]
+model_type: transformer
+
+transformer:
+    name: transformer
+
+    dim: 768
+    block_size: 2048
+
+    n_layer: 12
+    n_head: 12
+
+    use_fused_ops: True
+    use_qk_norm: True
+
+cat_transformer:
+    name: cat_transformer
+
+    block_size: 2048
+    chunk_size: 16
+
+    use_fused_ops: True
+    use_qk_norm: True
+
+    # decoder
+    n_layer: 12
+    dim: 1536
+    n_head: 12
+
+    dim_fx: 1536
+
+    # compressor
+    compressor_dim: 768
+    compressor_n_head: 12
+    dim_fx: 768
+    compressor_num_layers: 3
+
+
+# Populate the model settings based on selection in model_type
+model: ${${model_type}}
