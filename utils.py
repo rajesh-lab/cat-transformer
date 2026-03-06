@@ -56,7 +56,7 @@ def get_model(accelerate: Accelerator, cfg):
             vocab_size=cfg.dataset.vocab_size,
             block_size=cfg.model.block_size, 
 
-            use_fused_ops=cfg.model.use_fused_ops,
+            use_fused_ops=False,
             use_qk_norm=cfg.model.use_qk_norm,
 
             chunk_size=cfg.model.chunk_size, 
@@ -64,7 +64,7 @@ def get_model(accelerate: Accelerator, cfg):
             n_head=cfg.model.compressor_n_head, 
             dim_fx=cfg.model.dim_fx,  
             
-            n_layer=cfg.model.compressor_num_layers,
+            n_layer=cfg.model.compressor_n_layer,
         ) # layers are defined according to the paper, but one may use lower number of layers in the compressor
 
         decoder_config = CAT_Config(
@@ -78,7 +78,7 @@ def get_model(accelerate: Accelerator, cfg):
             chunk_size=cfg.model.chunk_size, 
             dim=cfg.model.dim, 
             n_head=cfg.model.n_head,
-            n_layer=num_layers
+            n_layer=cfg.model.n_layer
         )
 
         model = CAT_Transformer(decoder_config, compressor_config)
@@ -94,12 +94,37 @@ def get_model(accelerate: Accelerator, cfg):
 
 # https://github.com/Lightning-AI/litgpt/blob/main/litgpt/pretrain.py#L384
 @torch.no_grad()
-def validate(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.utils.data.DataLoader, cfg):
+def validate(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.utils.data.DataLoader, cfg, chunk_size_powers=None):
     
     print("Validating ...")
     model.eval()
 
     max_iters = cfg.eval.eval_iters
+
+    if chunk_size_powers is not None:
+        results = {}
+        for power in chunk_size_powers:
+            total_loss = 0.0
+            total_tokens = 0
+            desc = f"Evaluating (chunk={2**power})"
+            val_bar = tqdm(enumerate(val_dataloader), total=len(val_dataloader), desc=desc, disable=(not accelerate.is_main_process))
+            for k, batch in val_bar:
+                input_ids, targets = batch
+                if k >= max_iters:
+                    break
+                input_ids, targets = input_ids.to(accelerate.device), targets.to(accelerate.device)
+                num_tokens = (targets != -100).sum().item()
+                with accelerate.autocast():
+                    loss = model(input_ids, targets, chunk_size_power=power)
+                total_loss += loss.item() * num_tokens
+                total_tokens += num_tokens
+                val_bar.set_postfix_str(f"val loss: {total_loss / total_tokens:.4f}")
+            val_loss = total_loss / total_tokens
+            perplexity = math.exp(val_loss)
+            results[power] = (val_loss, perplexity)
+            accelerate.print(f"  chunk_size={2**power}: loss={val_loss:.4f}, ppl={perplexity:.4f}")
+        model.train()
+        return results
 
     total_loss = 0.0
     total_tokens = 0

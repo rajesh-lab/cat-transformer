@@ -127,7 +127,7 @@ cat_transformer:
     # compressor
     compressor_dim: 768
     compressor_n_head: 12
-    compressor_num_layers: 3
+    compressor_n_layer: 3
 
 
 # Populate the model settings based on selection in model_type
