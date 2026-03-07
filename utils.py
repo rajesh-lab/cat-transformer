@@ -3,6 +3,7 @@ from datetime import datetime
 import math
 import random
 import os
+import hydra
 import numpy as np
 
 from typing import Any, Iterable, List, Optional, Union
@@ -56,7 +57,7 @@ def get_model(accelerate: Accelerator, cfg):
             vocab_size=cfg.dataset.vocab_size,
             block_size=cfg.model.block_size, 
 
-            use_fused_ops=False,
+            use_fused_ops=False, # liger-kernels doesn't support vmaps
             use_qk_norm=cfg.model.use_qk_norm,
 
             chunk_size=cfg.model.chunk_size, 
@@ -242,7 +243,8 @@ def create_results_dir(cfg, datetime_str, accelerate):
     name = f"{datetime_str}"
     name = "/".join(name.split(" ")) # day/time
 
-    result_dir = os.path.join(cfg.results_dir, cfg.wandb.project, name)
+    original_cwd = hydra.utils.get_original_cwd()
+    result_dir = os.path.join(original_cwd, cfg.results_dir, cfg.wandb.project, name)
 
     os.makedirs(result_dir, exist_ok=True)
 

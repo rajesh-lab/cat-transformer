@@ -34,7 +34,7 @@ tokenizer_name = "gpt2"
 
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-save_path = "dataset/fineweb-1b"
+save_path = "dataset/fineweb-5b"
 
 
 def preprocess_and_tokenize_batched(examples):
@@ -97,7 +97,7 @@ def main():
     test_data = data["test"]  # ~100M tokens
 
     # shard train_data to get ~1B tokens (first 10B/2)
-    train_data = train_data.shard(num_shards=10, index=0)
+    train_data = train_data.shard(num_shards=2, index=0)
 
     # tokenize and save both splits
     tokenize_and_save("train", train_data, save_path)

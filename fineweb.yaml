@@ -1,6 +1,8 @@
 hydra:
   run:
     dir: Results/hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false
 
 # disable hydra logging
 defaults:
@@ -11,7 +13,7 @@ seed: 42
 
 dataset:
     name: fineweb
-    path: /scratch/jp7467/cat-transformer/dataset/fineweb-1b
+    path: /scratch/jp7467/cat-transformer/dataset/fineweb-5b
 
     # vocab_size: 32000
     vocab_size: 50257

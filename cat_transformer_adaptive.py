@@ -23,6 +23,8 @@ from transformer import (
 from torch.nn.attention.flex_attention import create_block_mask, BlockMask
 create_block_mask = torch.compile(create_block_mask)
 
+torch._dynamo.config.cache_size_limit = 8
+
 from liger_kernel.transformers import LigerRMSNorm, liger_rotary_pos_emb, LigerFusedLinearCrossEntropyLoss
 from liger_kernel.ops.swiglu import LigerSiLUMulFunction
 
@@ -271,14 +273,12 @@ class CAT_Transformer(nn.Module):
         assert chunk_size_power is not None
         cur_iter_chunk_size = power_of_2(chunk_size_power)
 
-        # handle non-multiple of chunk_size seqlen by padding
+        # pad to nearest 512 multiple to reduce flex attention recompilations
+        pad_multiple = 512
         slice_end = False
-        if seqlen % cur_iter_chunk_size != 0:
-            # pad to the next multiple of chunk_size
-            new_seqlen = ((seqlen // cur_iter_chunk_size) + 1) * cur_iter_chunk_size
+        if seqlen % pad_multiple != 0:
+            new_seqlen = ((seqlen // pad_multiple) + 1) * pad_multiple
             pad_len = new_seqlen - seqlen
-            # padding with zero (which is usually the pad token)
-            # JP: replace with appropriate pad token of tokenizer
             input_ids = F.pad(input_ids, (0, pad_len), value=0) 
             old_seqlen = seqlen
             seqlen = new_seqlen
