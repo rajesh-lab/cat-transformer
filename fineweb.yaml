@@ -13,12 +13,14 @@ seed: 42
 
 dataset:
     name: fineweb
-    path: /scratch/jp7467/cat-transformer/dataset/fineweb-5b
 
-    # vocab_size: 32000
+    path: /scratch/jp7467/cat-transformer/dataset/fineweb-10b
+    tokenizer_name: "gpt2"
     vocab_size: 50257
 
-    tokenizer_name: "gpt2"
+    # path: /scratch/jp7467/cat-transformer/dataset/fineweb-10b-llama2
+    # tokenizer_name: "meta-llama/Llama-2-7b-hf"
+    # vocab_size: 32000
 
 results_dir: Results
 
@@ -62,10 +64,6 @@ train:
     grad_accum: 1
 
     norm_eps: 0.00001
-
-    loss_mult: 1.0
-
-    cycle_upper: 999999
 
 # Evaluation-related arguments.
 eval:

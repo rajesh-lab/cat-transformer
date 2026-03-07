@@ -214,3 +214,6 @@ __marimo__/
 dataset/
 
 Results/
+
+eval/*.json
+eval/results/

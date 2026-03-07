@@ -3,8 +3,18 @@ lm-evaluation-harness wrapper for Transformer and CAT_Transformer models.
 
 Usage:
     python eval/harness.py --model_type chunked --tasks hellaswag,arc_easy
-    python eval/harness.py --model_type vanilla --tasks hellaswag --batch_size 4
-    python eval/harness.py --model_type chunked --tasks swde --chunk_size_power 2 --limit 100
+
+    python eval/harness.py --model_type vanilla --chunk_size_power -1 --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_1 --metadata '{"max_seq_lengths":[1024]}' --limit 10 --output_path eval/test.json
+
+    python eval/harness.py --model_type chunked --chunk_size_power 3 --tasks niah_single_1 --metadata '{"max_seq_lengths":[1024]}' --output_path eval/test.json
+
+    # wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_1
+    # swde,fda
+    # niah_single_1 --metadata '{"max_seq_lengths":[1024]}'
+    # niah_single_2 --metadata '{"max_seq_lengths":[1024]}'
+
+    python eval/harness.py --model_type chunked --chunk_size_power 2 --tasks niah_single_1 --limit 100 --metadata '{"max_seq_lengths":[1024]}'
+
 """
 
 from __future__ import annotations
@@ -36,6 +46,7 @@ MODEL_TYPE_TO_PATH = {
 
 }
 
+TOKENIZER_NAME = "gpt2"
 
 def get_model(model_type):
     if model_type == "vanilla":
@@ -110,7 +121,7 @@ class CATTransformerLM(HFLM):
         self.chunk_size_power = chunk_size_power
 
         # load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        self.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # load model
@@ -193,6 +204,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_fewshot", type=int, default=0, help="Number of few-shot examples (default: 0)")
     parser.add_argument("--limit", type=float, default=None, help="Limit number of examples per task")
     parser.add_argument("--output_path", type=str, default=None, help="Path to save results JSON")
+    parser.add_argument("--metadata", type=str, default=None, help='Task metadata JSON (e.g. \'{"max_seq_lengths":[1024]}\')')
     args = parser.parse_args()
 
     lm = CATTransformerLM(
@@ -204,13 +216,23 @@ if __name__ == "__main__":
 
     task_list = [t.strip() for t in args.tasks.split(",")]
 
-    results = lm_eval.simple_evaluate(
+    metadata = json.loads(args.metadata) if args.metadata else {}
+    if "tokenizer" not in metadata and "pretrained" not in metadata:
+        metadata["tokenizer"] = TOKENIZER_NAME
+
+    from lm_eval.tasks import TaskManager
+    task_manager = TaskManager(metadata=metadata)
+
+    eval_kwargs = dict(
         model=lm,
         tasks=task_list,
+        task_manager=task_manager,
         num_fewshot=args.num_fewshot,
         batch_size=args.batch_size,
         limit=args.limit,
     )
+
+    results = lm_eval.simple_evaluate(**eval_kwargs)
 
     # print results
     print("\n" + "=" * 60)
