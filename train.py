@@ -240,11 +240,12 @@ def main(cfg: DictConfig):
                         })
             else:
                 val_loss, val_perplexity = validate(accelerate, model, test_dataloader, cfg)
-                accelerate.print(f"Validation Loss: {val_loss:.4f}")
-                wandb.log({
-                    "val/loss": val_loss,
-                    "val/perplexity": val_perplexity,
-                })
+                accelerate.print(f"Validation loss={val_loss:.4f}, ppl={val_perplexity:.4f}")
+                if accelerate.is_main_process:
+                    wandb.log({
+                        "val/loss": val_loss,
+                        "val/perplexity": val_perplexity,
+                    })
 
             if accelerate.is_main_process and (iter_num % cfg.train.save_interval == 0) and (iter_num > 0):
 
