@@ -76,21 +76,27 @@ def main(cfg: DictConfig):
 
     accelerate.print(OmegaConf.to_container(cfg, resolve=True), "\n")
 
-    train_dataset, test_dataset, data_config = get_dataset(cfg)
+    train_dataset, test_dataset, data_config = get_dataset(
+        cfg, process_rank=accelerate.process_index, num_processes=accelerate.num_processes
+    )
     tokenizer = AutoTokenizer.from_pretrained(data_config["tokenizer_name"])
 
     # Create a generator for reproducible shuffling
-    g = torch.Generator()
-    g.manual_seed(334) # same data order
+    # g = torch.Generator()
+    # g.manual_seed(334) # same data order
+    # train_dataloader = torch.utils.data.DataLoader(
+    #     train_dataset,
+    #     batch_size=cfg.train.batch_size,
+    #     shuffle=True,
+    #     num_workers=0,
+    #     pin_memory=True,
+    #     generator=g,
+    # )
+    # train_dataloader = accelerate.prepare_data_loader(train_dataloader)
+    # train_iterator = CycleIterator(train_dataloader)
 
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=cfg.train.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True,
-        generator=g,
-    )
+    # directly use DataLoaderLite
+    train_iterator = CycleIterator(train_dataset)
     
     test_dataloader = torch.utils.data.DataLoader(
         test_dataset,
@@ -99,9 +105,6 @@ def main(cfg: DictConfig):
         num_workers=0,
         pin_memory=True
     ) # we don't prepare the val_loader since we test on all processes!
-
-    train_dataloader = accelerate.prepare_data_loader(train_dataloader)
-    train_iterator = CycleIterator(train_dataloader)
 
     # get model
     model = get_model(accelerate, cfg)

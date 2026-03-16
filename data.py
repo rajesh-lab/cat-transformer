@@ -1,6 +1,8 @@
 import os
 import torch
 
+from data_loader import DataLoaderLite
+
 class RandomBatchDataset(torch.utils.data.Dataset):
     def __init__(self, input_ids, context_length):
 
@@ -29,9 +31,9 @@ class RandomBatchDataset(torch.utils.data.Dataset):
         return train_tokens, target_tokens
 
 
-def get_dataset(cfg):
-    train_dataset = RandomBatchDataset(
-        torch.load(os.path.join(cfg.dataset.path, "train.pt"), weights_only=False), cfg.model.block_size
+def get_dataset(cfg, process_rank=0, num_processes=1):
+    train_dataset = DataLoaderLite(
+        cfg, split="train", process_rank=process_rank, num_processes=num_processes, seed=cfg.seed,
     )
     test_dataset = RandomBatchDataset(
         torch.load(os.path.join(cfg.dataset.path, "test.pt"), weights_only=False), cfg.model.block_size

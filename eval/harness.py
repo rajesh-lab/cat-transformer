@@ -4,7 +4,7 @@ lm-evaluation-harness wrapper for Transformer and CAT_Transformer models.
 Usage:
     python eval/harness.py --model_type chunked --tasks hellaswag,arc_easy
 
-    python eval/harness.py --model_type vanilla --chunk_size_power -1 --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_1 --metadata '{"max_seq_lengths":[1024]}' --limit 10 --output_path eval/test.json
+    python eval/harness.py --model_type chunked --chunk_size_power 2 --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_1 --metadata '{"max_seq_lengths":[2048]}' --limit 10 --output_path eval/test.json
 
     python eval/harness.py --model_type chunked --chunk_size_power 3 --tasks niah_single_1 --metadata '{"max_seq_lengths":[1024]}' --output_path eval/test.json
 
@@ -36,22 +36,28 @@ import lm_eval
 from lm_eval.api.model import LM
 from lm_eval.models.huggingface import HFLM
 
-BLOCK_SIZE = 1024
+BLOCK_SIZE = 2048
 
 MODEL_TYPE_TO_PATH = {
     
-    "vanilla": "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/12:07:04.421670/state_dict.pt",
+    # "vanilla": "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/12:07:04.421670/state_dict.pt",
+    # "chunked": "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/15:40:25.010151/state_dict.pt",
 
-    "chunked": "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/15:40:25.010151/state_dict.pt",
+    # llama2 tokenization -- 10B tokens, 2K context, D=1024
+    "vanilla" : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-08/20:35:53.414785/state_dict.pt",
+    "chunked" : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-07/17:35:43.210462/state_dict.pt", # chunk_size=4,8,16,32
 
 }
 
-TOKENIZER_NAME = "gpt2"
+# TOKENIZER_NAME = "gpt2"
+TOKENIZER_NAME = "meta-llama/Llama-2-7b-hf"
+
+VOCAB_SIZE = 32000
 
 def get_model(model_type):
     if model_type == "vanilla":
         config = TransformerConfig(
-            vocab_size=50257,
+            vocab_size=VOCAB_SIZE,
             block_size=BLOCK_SIZE,
             dim=1024,
             n_head=16,
@@ -62,9 +68,9 @@ def get_model(model_type):
         return Transformer(config)
 
     elif model_type == "chunked":
-        chunk_size = 16
+        chunk_size = 32
         compressor_config = CAT_Config(
-            vocab_size=50257,
+            vocab_size=VOCAB_SIZE,
             block_size=BLOCK_SIZE,
             chunk_size=chunk_size,
             dim=1024,
@@ -74,7 +80,7 @@ def get_model(model_type):
             use_qk_norm=True,
         )
         decoder_config = CAT_Config(
-            vocab_size=50257,
+            vocab_size=VOCAB_SIZE,
             block_size=BLOCK_SIZE,
             chunk_size=chunk_size,
             dim=2048,
