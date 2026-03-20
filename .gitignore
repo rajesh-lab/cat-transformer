@@ -218,3 +218,4 @@ Results/
 eval/*.json
 eval/results/
 eval/llama_results/
+eval/gpt2_15b/
