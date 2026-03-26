@@ -3,7 +3,7 @@ FineWeb-Edu dataset (for srs pretraining)
 https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
 Downloads and tokenizes the data and saves data shards to disk.
 Run simply as:
-$ python fineweb.py
+$ python prepare_sharded_fineweb.py
 Will save shards to the local directory "edu_fineweb10B".
 """
 
@@ -15,13 +15,13 @@ from tqdm import tqdm  # pip install tqdm
 from transformers import AutoTokenizer  # pip install transformers
 
 # ------------------------------------------
-local_dir = "/scratch/jp7467/Datasets/fineweb-50b-llama2"
+local_dir = "/gpfs/data/ranganathlab/Jatin/Datasets/new-fineweb-5b-gpt2"
 dataset_name = "HuggingFaceFW/fineweb-edu"
-remote_name = "sample-100BT"
+remote_name = "sample-10BT"
 shard_size = 100_000_000  # 500M tokens per shard
 use_eos_token = True # append EOS token before each document
-# TOKENIZER_NAME = "gpt2"
-TOKENIZER_NAME = "meta-llama/Llama-2-7b-hf"
+TOKENIZER_NAME = "gpt2"
+# TOKENIZER_NAME = "meta-llama/Llama-2-7b-hf"
 
 # local_dir = "/gpfs/data/ranganathlab/Jatin/Datasets/wikitext-sharded-fixed"
 # dataset_name = "wikitext"
@@ -74,7 +74,7 @@ fw = load_dataset(dataset_name, name=remote_name, split="train")
 fw = fw.train_test_split(test_size=0.01, shuffle=False, seed=42)
 
 fw = fw["train"]  # use train split for now
-fw = fw.shard(num_shards=2, index=0)  # first ~50B tokens
+fw = fw.shard(num_shards=2, index=0)  # first ~5B tokens
 
 print(fw)
 
