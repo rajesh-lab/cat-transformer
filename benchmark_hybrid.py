@@ -62,6 +62,13 @@ def main():
                         help="GDN intra-chunk mode")
     parser.add_argument("--no_short_conv", action="store_true",
                         help="Disable short convolutions in GDN layers")
+    parser.add_argument("--mamba2_frac", type=float, default=0.5,
+                        help="Fraction of layers that use Mamba2/SSD (0.0 = skip, 1.0 = all)")
+    parser.add_argument("--mamba2_mode", type=str, default="parallel",
+                        choices=["naive", "parallel"],
+                        help="Mamba2 mode (naive or parallel)")
+    parser.add_argument("--mamba2_state_size", type=int, default=64,
+                        help="Mamba2 SSM state dimension N")
     args = parser.parse_args()
 
     device = "cuda"
@@ -92,6 +99,16 @@ def main():
         step_g = args.num_layers / n_gdn
         gdn_layers = [int(i * step_g) for i in range(n_gdn)]
 
+    # decide which layers are Mamba2 (same spacing logic)
+    n_m2 = max(0, min(args.num_layers, round(args.num_layers * args.mamba2_frac)))
+    if n_m2 == 0:
+        mamba2_layers = []
+    elif n_m2 == args.num_layers:
+        mamba2_layers = list(range(args.num_layers))
+    else:
+        step_m = args.num_layers / n_m2
+        mamba2_layers = [int(i * step_m) for i in range(n_m2)]
+
     print("=" * 70)
     print("Parallel vs Hybrid CAT — Training Throughput")
     print("=" * 70)
@@ -101,6 +118,7 @@ def main():
     print(f"  warmup={args.warmup}  steps={args.steps}")
     print(f"  linear_frac={args.linear_frac}  → linear layers: {linear_layers}")
     print(f"  gdn_frac={args.gdn_frac}  → GDN layers: {gdn_layers}  mode={args.gdn_mode}")
+    print(f"  mamba2_frac={args.mamba2_frac}  → Mamba2 layers: {mamba2_layers}  mode={args.mamba2_mode}  N={args.mamba2_state_size}")
     print("=" * 70)
 
     decoder_dim = 2 * args.dim
@@ -142,6 +160,15 @@ def main():
         gdn_use_short_conv=not args.no_short_conv,
     )
 
+    mamba2_config = HybridCAT_Config(
+        dim=decoder_dim, n_head=n_head_decoder,
+        block_size=args.block_size, chunk_size=args.chunk_size,
+        n_layer=args.num_layers,
+        mamba2_layers=mamba2_layers,
+        mamba2_mode=args.mamba2_mode,
+        mamba2_state_size=args.mamba2_state_size,
+    )
+
     # synthetic data (kept on GPU across runs)
     input_ids = torch.randint(
         0, parallel_config.vocab_size,
@@ -164,11 +191,12 @@ def main():
     model_specs = [
         ("Parallel",     parallel_config),
     ]
-    if linear_layers:
-        # model_specs.append(("Hybrid-Linear",       hybrid_config))
-        # model_specs.append(("Hybrid-Lin-Naive", naive_config))
-    if gdn_layers:
-        model_specs.append(("Hybrid-GDN", gdn_config))
+    # if linear_layers:
+    #     model_specs.append(("Hybrid-Linear", hybrid_config))
+    # if gdn_layers:
+    #     model_specs.append(("Hybrid-GDN", gdn_config))
+    if mamba2_layers:
+        model_specs.append(("Hybrid-Mamba2", mamba2_config))
 
     # --- benchmark each model independently for accurate memory ---
     results = {}

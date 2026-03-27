@@ -32,6 +32,7 @@ from transformer import (
 )
 from cat_transformer import CAT_Config, Compressor, get_cat_mask
 from gated_deltanet import naive_recurrent_gdn_cat, chunk_gdn_cat, chunk_gdn_cat_parallel
+from mamba2_ssd import naive_mamba2_cat, mamba2_parallel_cat
 
 from torch.nn.attention.flex_attention import create_block_mask, BlockMask
 create_block_mask = torch.compile(create_block_mask)
@@ -389,6 +390,187 @@ class CATGatedDeltaNetBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# CATMamba2 — Mamba2/SSD-based drop-in replacement for Attention
+# --------------------------------------------------------------------------- #
+
+class CATMamba2(nn.Module):
+    """Mamba2/SSD with the CAT block-sparse mask.
+
+    Uses pre-discretized SSM inputs and the chunked parallel SSD algorithm
+    from mamba2_ssd.py.  Two modes:
+      'naive'    — token-by-token  (naive_mamba2_cat)
+      'parallel' — chunked parallel (mamba2_parallel_cat)
+
+    Following the fla Mamba2 layer reference:
+    - Single in_proj producing (gate, x_BC, dt)
+    - Depthwise causal convolution on (x, B, C) with SiLU activation
+    - A / dt discretization
+    - D skip connection
+    - Per-head RMSNorm + SiLU-gated output
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_idx: int,
+        cat_block_size: int,
+        mode: str = 'parallel',
+        state_size: int = 64,
+        n_groups: int = 1,
+        conv_kernel: int = 4,
+        use_conv: bool = True,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.cat_block_size = cat_block_size
+        self.mode = mode
+        assert mode in ('naive', 'parallel')
+
+        self.n_head = config.n_head
+        self.head_dim = config.head_dim
+        self.dim = config.dim
+        self.state_size = state_size
+        self.n_groups = n_groups
+        self.intermediate_size = config.n_head * config.head_dim
+        self.use_conv = use_conv
+
+        self.conv_dim = self.intermediate_size + 2 * n_groups * state_size
+        projection_size = self.intermediate_size + self.conv_dim + config.n_head
+        self.in_proj = nn.Linear(config.dim, projection_size, bias=False)
+
+        if use_conv:
+            self.conv1d = nn.Conv1d(
+                self.conv_dim, self.conv_dim, conv_kernel,
+                padding=conv_kernel - 1, groups=self.conv_dim, bias=False,
+            )
+
+        A = torch.empty(config.n_head, dtype=torch.float32).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+
+        dt_min, dt_max = 0.001, 0.1
+        dt = torch.exp(
+            torch.rand(config.n_head) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min),
+        )
+        dt = torch.clamp(dt, min=1e-4)
+        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
+        self.dt_bias._no_weight_decay = True
+
+        self.D = nn.Parameter(torch.ones(config.n_head))
+        self.D._no_weight_decay = True
+
+        self.o_norm = RMSNorm(config.head_dim, eps=config.norm_eps)
+        self.wo = nn.Linear(self.intermediate_size, config.dim, bias=False)
+
+    def forward(
+        self, x: Tensor, cos: Tensor, sin: Tensor,
+        is_causal: bool = True, mask=None, input_pos=None,
+    ) -> Tensor:
+        bsz, seqlen, _ = x.shape
+
+        projected = self.in_proj(x)
+        gate, x_BC, dt = projected.split(
+            [self.intermediate_size, self.conv_dim, self.n_head], dim=-1,
+        )
+
+        if self.use_conv:
+            x_BC = F.silu(
+                self.conv1d(x_BC.transpose(1, 2))[..., :seqlen].transpose(1, 2)
+            )
+
+        groups_state_size = self.n_groups * self.state_size
+        x_ssm, B, C = x_BC.split(
+            [self.intermediate_size, groups_state_size, groups_state_size], dim=-1,
+        )
+
+        x_ssm = x_ssm.view(bsz, seqlen, self.n_head, self.head_dim)
+        B = B.view(bsz, seqlen, self.n_groups, self.state_size)
+        C = C.view(bsz, seqlen, self.n_groups, self.state_size)
+
+        if self.n_groups < self.n_head:
+            n_rep = self.n_head // self.n_groups
+            B = B.unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
+            B = B.reshape(bsz, seqlen, self.n_head, self.state_size)
+            C = C.unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
+            C = C.reshape(bsz, seqlen, self.n_head, self.state_size)
+
+        A = -torch.exp(self.A_log.float())
+        dt_val = F.softplus(dt.float() + self.dt_bias).to(x.dtype)
+
+        a = A.to(x.dtype) * dt_val                       # (B, T, H) log-decay
+        x_disc = x_ssm * dt_val.unsqueeze(-1)             # (B, T, H, D)
+        D_skip = self.D[None, None, :, None] * x_ssm      # (B, T, H, D)
+
+        C_bs = self.cat_block_size
+        pad_len = (C_bs - seqlen % C_bs) % C_bs
+        if pad_len > 0:
+            x_disc = F.pad(x_disc, (0, 0, 0, 0, 0, pad_len))
+            a = F.pad(a, (0, 0, 0, pad_len))
+            B = F.pad(B, (0, 0, 0, 0, 0, pad_len))
+            C = F.pad(C, (0, 0, 0, 0, 0, pad_len))
+
+        if self.mode == 'naive':
+            y = naive_mamba2_cat(x_disc, a, B, C, chunk_size=C_bs)
+        else:
+            y = mamba2_parallel_cat(x_disc, a, B, C, chunk_size=C_bs)
+
+        if pad_len > 0:
+            y = y[:, :seqlen, :, :]
+
+        y = y + D_skip
+
+        gate = F.silu(gate.view(bsz, seqlen, self.n_head, self.head_dim))
+        y = self.o_norm(y) * gate
+
+        y = y.contiguous().view(bsz, seqlen, self.intermediate_size)
+        return self.wo(y)
+
+
+# --------------------------------------------------------------------------- #
+# CATMamba2Block — TransformerBlock with Mamba2/SSD attention
+# --------------------------------------------------------------------------- #
+
+class CATMamba2Block(nn.Module):
+    """TransformerBlock variant that uses CATMamba2 + MLP."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_idx: int,
+        cat_block_size: int,
+        mode: str = 'parallel',
+        state_size: int = 64,
+        n_groups: int = 1,
+        conv_kernel: int = 4,
+        use_conv: bool = True,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.attention = CATMamba2(
+            config, layer_idx, cat_block_size,
+            mode=mode, state_size=state_size, n_groups=n_groups,
+            conv_kernel=conv_kernel, use_conv=use_conv,
+        )
+
+        if config.use_fused_ops:
+            self.feed_forward = LigerSwiGLUMLP(config)
+            self.ffn_norm = LigerRMSNorm(config.dim, eps=config.norm_eps)
+            self.attention_norm = LigerRMSNorm(config.dim, eps=config.norm_eps)
+        else:
+            self.feed_forward = LLaMAMLP(config)
+            self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
+            self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
+
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
+                is_causal: bool = True, mask=None, input_pos=None) -> Tensor:
+        h = x + self.attention(self.attention_norm(x), cos, sin, is_causal, mask=mask, input_pos=input_pos)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
+
+# --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
 
@@ -396,10 +578,16 @@ class CATGatedDeltaNetBlock(nn.Module):
 class HybridCAT_Config(CAT_Config):
     linear_attn_layers: List[int] = field(default_factory=list)
     gdn_layers: List[int] = field(default_factory=list)
+    mamba2_layers: List[int] = field(default_factory=list)
     use_naive_linear_attn: bool = False
     gdn_mode: str = 'parallel'
     gdn_use_short_conv: bool = True
     gdn_conv_size: int = 4
+    mamba2_mode: str = 'parallel'
+    mamba2_state_size: int = 64
+    mamba2_n_groups: int = 1
+    mamba2_conv_kernel: int = 4
+    mamba2_use_conv: bool = True
 
 
 # --------------------------------------------------------------------------- #
@@ -438,6 +626,15 @@ class CAT_Transformer_Hybrid(nn.Module):
                     use_short_conv=config.gdn_use_short_conv,
                     conv_size=config.gdn_conv_size,
                 ))
+            elif i in config.mamba2_layers:
+                self.layers.append(CATMamba2Block(
+                    config, layer_idx=i, cat_block_size=cat_block_size,
+                    mode=config.mamba2_mode,
+                    state_size=config.mamba2_state_size,
+                    n_groups=config.mamba2_n_groups,
+                    conv_kernel=config.mamba2_conv_kernel,
+                    use_conv=config.mamba2_use_conv,
+                ))
             elif i in config.linear_attn_layers:
                 self.layers.append(CATLinearBlock(
                     config, layer_idx=i, cat_block_size=cat_block_size,
@@ -465,7 +662,7 @@ class CAT_Transformer_Hybrid(nn.Module):
         self.apply(lambda m: _init_weights(m, self.config.n_layer, self.config.dim))
         self.f.apply(lambda m: _init_weights(m, self.f.config.n_layer, self.f.config.dim))
         for layer in self.layers:
-            if isinstance(layer, (CATLinearBlock, CATGatedDeltaNetBlock)):
+            if isinstance(layer, (CATLinearBlock, CATGatedDeltaNetBlock, CATMamba2Block)):
                 nn.init.normal_(
                     layer.attention.wo.weight,
                     mean=0.0, std=1.0 / math.sqrt(config.dim) / config.n_layer,
@@ -500,7 +697,8 @@ class CAT_Transformer_Hybrid(nn.Module):
         n_std = sum(1 for l in self.layers if isinstance(l, TransformerBlock))
         n_lin = sum(1 for l in self.layers if isinstance(l, CATLinearBlock))
         n_gdn = sum(1 for l in self.layers if isinstance(l, CATGatedDeltaNetBlock))
-        print(f"Hybrid CAT: {n_std} standard + {n_lin} linear + {n_gdn} GDN layers")
+        n_m2 = sum(1 for l in self.layers if isinstance(l, CATMamba2Block))
+        print(f"Hybrid CAT: {n_std} standard + {n_lin} linear + {n_gdn} GDN + {n_m2} Mamba2 layers")
         print("cos shape:", self.cos.shape)
 
     # ---- generation helpers ----
@@ -704,49 +902,99 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------- #
     # GDN hybrid: parallel vs naive modes
     # ------------------------------------------------------------------- #
+    # print()
+    # print("=" * 70)
+    # print("GDN hybrid correctness check (parallel vs naive mode)")
+    # print("=" * 70)
+
+    # gdn_layers = list(range(0, num_layers, 2))
+
+    # decoder_config_gdn_par = HybridCAT_Config(
+    #     dim=decoder_dim, n_head=n_head_decoder,
+    #     block_size=block_size, chunk_size=chunk_size,
+    #     n_layer=num_layers,
+    #     gdn_layers=gdn_layers,
+    #     gdn_mode='parallel',
+    # )
+    # decoder_config_gdn_naive = HybridCAT_Config(
+    #     dim=decoder_dim, n_head=n_head_decoder,
+    #     block_size=block_size, chunk_size=chunk_size,
+    #     n_layer=num_layers,
+    #     gdn_layers=gdn_layers,
+    #     gdn_mode='naive',
+    # )
+
+    # model_gdn_par = CAT_Transformer_Hybrid(decoder_config_gdn_par, compressor_config)
+    # model_gdn_par = model_gdn_par.to(device=device)
+    # model_gdn_par.setup_cache(device=device)
+
+    # model_gdn_naive = CAT_Transformer_Hybrid(decoder_config_gdn_naive, compressor_config)
+    # model_gdn_naive.load_state_dict(model_gdn_par.state_dict())
+    # model_gdn_naive = model_gdn_naive.to(device=device)
+    # model_gdn_naive.setup_cache(device=device)
+
+    # n_params_gdn = sum(p.numel() for p in model_gdn_par.parameters())
+    # print(f"Total params (GDN hybrid): {n_params_gdn / 1e6:.1f}M")
+    # print(f"GDN layers: {gdn_layers}")
+
+    # with torch.no_grad():
+    #     logits_gdn_par = model_gdn_par(input_ids)
+    #     logits_gdn_naive = model_gdn_naive(input_ids)
+
+    # diff_gdn = (logits_gdn_par - logits_gdn_naive).abs()
+    # print(f"Max abs diff (parallel vs naive):  {diff_gdn.max().item():.6e}")
+    # print(f"Mean abs diff (parallel vs naive): {diff_gdn.mean().item():.6e}")
+    # if diff_gdn.max().item() < 1e-2:
+    #     print("PASS: GDN parallel and naive agree")
+    # else:
+    #     print("WARN: GDN parallel and naive differ significantly")
+
+    # ------------------------------------------------------------------- #
+    # Mamba2 hybrid: parallel vs naive modes
+    # ------------------------------------------------------------------- #
     print()
     print("=" * 70)
-    print("GDN hybrid correctness check (parallel vs naive mode)")
+    print("Mamba2 hybrid correctness check (parallel vs naive mode)")
     print("=" * 70)
 
-    gdn_layers = list(range(0, num_layers, 2))
+    mamba2_layers = list(range(0, num_layers, 2))
 
-    decoder_config_gdn_par = HybridCAT_Config(
+    decoder_config_m2_par = HybridCAT_Config(
         dim=decoder_dim, n_head=n_head_decoder,
         block_size=block_size, chunk_size=chunk_size,
         n_layer=num_layers,
-        gdn_layers=gdn_layers,
-        gdn_mode='parallel',
+        mamba2_layers=mamba2_layers,
+        mamba2_mode='parallel',
     )
-    decoder_config_gdn_naive = HybridCAT_Config(
+    decoder_config_m2_naive = HybridCAT_Config(
         dim=decoder_dim, n_head=n_head_decoder,
         block_size=block_size, chunk_size=chunk_size,
         n_layer=num_layers,
-        gdn_layers=gdn_layers,
-        gdn_mode='naive',
+        mamba2_layers=mamba2_layers,
+        mamba2_mode='naive',
     )
 
-    model_gdn_par = CAT_Transformer_Hybrid(decoder_config_gdn_par, compressor_config)
-    model_gdn_par = model_gdn_par.to(device=device)
-    model_gdn_par.setup_cache(device=device)
+    model_m2_par = CAT_Transformer_Hybrid(decoder_config_m2_par, compressor_config)
+    model_m2_par = model_m2_par.to(device=device)
+    model_m2_par.setup_cache(device=device)
 
-    model_gdn_naive = CAT_Transformer_Hybrid(decoder_config_gdn_naive, compressor_config)
-    model_gdn_naive.load_state_dict(model_gdn_par.state_dict())
-    model_gdn_naive = model_gdn_naive.to(device=device)
-    model_gdn_naive.setup_cache(device=device)
+    model_m2_naive = CAT_Transformer_Hybrid(decoder_config_m2_naive, compressor_config)
+    model_m2_naive.load_state_dict(model_m2_par.state_dict())
+    model_m2_naive = model_m2_naive.to(device=device)
+    model_m2_naive.setup_cache(device=device)
 
-    n_params_gdn = sum(p.numel() for p in model_gdn_par.parameters())
-    print(f"Total params (GDN hybrid): {n_params_gdn / 1e6:.1f}M")
-    print(f"GDN layers: {gdn_layers}")
+    n_params_m2 = sum(p.numel() for p in model_m2_par.parameters())
+    print(f"Total params (Mamba2 hybrid): {n_params_m2 / 1e6:.1f}M")
+    print(f"Mamba2 layers: {mamba2_layers}")
 
     with torch.no_grad():
-        logits_gdn_par = model_gdn_par(input_ids)
-        logits_gdn_naive = model_gdn_naive(input_ids)
+        logits_m2_par = model_m2_par(input_ids)
+        logits_m2_naive = model_m2_naive(input_ids)
 
-    diff_gdn = (logits_gdn_par - logits_gdn_naive).abs()
-    print(f"Max abs diff (parallel vs naive):  {diff_gdn.max().item():.6e}")
-    print(f"Mean abs diff (parallel vs naive): {diff_gdn.mean().item():.6e}")
-    if diff_gdn.max().item() < 1e-2:
-        print("PASS: GDN parallel and naive agree")
+    diff_m2 = (logits_m2_par - logits_m2_naive).abs()
+    print(f"Max abs diff (parallel vs naive):  {diff_m2.max().item():.6e}")
+    print(f"Mean abs diff (parallel vs naive): {diff_m2.mean().item():.6e}")
+    if diff_m2.max().item() < 1e-2:
+        print("PASS: Mamba2 parallel and naive agree")
     else:
-        print("WARN: GDN parallel and naive differ significantly")
+        print("WARN: Mamba2 parallel and naive differ significantly")
