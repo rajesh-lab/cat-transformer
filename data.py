@@ -31,7 +31,51 @@ class RandomBatchDataset(torch.utils.data.Dataset):
         return train_tokens, target_tokens
 
 
+# inspired from: https://github.com/HazyResearch/zoology/blob/c42ae3370b9b13a04a23c5f9f4d967469ecb8958/zoology/data/utils.py#L126
+class MQARDataset(torch.utils.data.Dataset):
+    """Pre-batched MQAR dataset. Each segment corresponds to a different num_kv_pairs."""
+    def __init__(self, cfg, split="train"):
+        self.model_name = cfg.model.name
+        self.segments = torch.load(os.path.join(cfg.dataset.path, f"{split}.pt"), weights_only=False)
+        self.batch_size = cfg.train.batch_size
+        self.batches = [
+            (segment_idx, batch_start)
+            for segment_idx, segment in enumerate(self.segments)
+            for batch_start in range(0, len(segment[0][0]), self.batch_size)
+        ]
+        num_tokens = sum(x[0][0].shape[0] * x[0][0].shape[1] for x in self.segments)
+
+        print("Loading MQAR dataset from:", cfg.dataset.path)
+        print(f"~~~~~~ Total tokens in the dataset: {num_tokens:,} ~~~~~~")
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __getitem__(self, idx):
+        segment_idx, batch_start = self.batches[idx]
+        config = self.segments[segment_idx][1]
+        input_ids, labels, _examples = self.segments[segment_idx][0]
+
+        slc = slice(batch_start, batch_start + self.batch_size)
+        input_ids = input_ids[slc]
+        labels = labels[slc]
+
+        if self.model_name == "cat_transformer":
+            assert torch.all(labels[:, -1] == -100)
+            return input_ids, labels[:, :-1], config
+        else:
+            return input_ids, labels, config
+
+
 def get_dataset(cfg, process_rank=0, num_processes=1):
+    if cfg.dataset.name == "mqar":
+        train_dataset = MQARDataset(cfg, split="train")
+        test_dataset = MQARDataset(cfg, split="test")
+        return train_dataset, test_dataset, dict(
+            vocab_size=cfg.dataset.vocab_size,
+            tokenizer_name=getattr(cfg.dataset, "tokenizer_name", None),
+        )
+
     train_dataset = DataLoaderLite(
         cfg, split="train", process_rank=process_rank, num_processes=num_processes, seed=cfg.seed,
     )

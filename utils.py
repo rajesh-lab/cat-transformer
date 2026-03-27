@@ -131,7 +131,10 @@ def validate(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.ut
     total_tokens = 0
     val_bar = tqdm(enumerate(val_dataloader), total=len(val_dataloader), desc="Evaluating", disable=(not accelerate.is_main_process))
     for k, batch in val_bar:
-        input_ids, targets = batch
+        if len(batch) == 3:
+            input_ids, targets, _batch_config = batch
+        else:
+            input_ids, targets = batch
 
         if k >= max_iters:
             break
@@ -274,3 +277,117 @@ def calculate_grad_norm(model, norm_type=2.0, scaler=None):
         total_norm = torch.norm(torch.stack([torch.norm(g, norm_type) for g in grads]), norm_type)
 
     return total_norm.item()
+
+
+@torch.no_grad()
+def measure_accuracy(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.utils.data.DataLoader, cfg, wandb, split="val", step=None, max_iters=-1) -> torch.Tensor:
+    
+    print("Accuracy validation...")
+    model.eval()
+
+    acc = list()
+    predictions = list()
+    acc_kv = dict()
+
+    val_bar = tqdm(enumerate(val_dataloader), total=len(val_dataloader), desc="Evaluating", disable=(not accelerate.is_main_process))
+    for k, (input_ids, targets, batch_config) in val_bar:
+        
+        # NOTE: remove max_iters in accuracy eval 16-04-2025
+        if max_iters != -1 and k >= max_iters:
+            break
+
+        input_ids, targets = input_ids.to(accelerate.device), targets.to(accelerate.device)
+        
+        if cfg.dataset.name == "mqar":
+            input_ids = input_ids.squeeze(0)
+            if targets is not None:
+                targets = targets.squeeze(0)
+                
+        with accelerate.autocast():
+            output_logits = model(input_ids)
+
+        cur_pred = output_logits.argmax(dim=-1)
+        # cur_probs = output_logits.softmax(dim=-1).max(dim=-1).values
+        mask = targets != -100
+        # calculate accuracy
+        cur_acc = (cur_pred == targets).float().masked_select(mask)
+        # cur_pred = cur_pred.masked_select(mask)
+        # cur_targets = targets.masked_select(mask)
+        # cur_probs = cur_probs.masked_select(mask)
+
+        cur_acc = cur_acc.view(input_ids.shape[0], -1)
+        # cur_pred = cur_pred.view(input_ids.shape[0], -1)
+        # cur_targets = cur_targets.view(input_ids.shape[0], -1)
+        # cur_probs = cur_probs.view(input_ids.shape[0], -1)
+
+        acc.append(cur_acc.mean().unsqueeze(0))
+        # predictions.append(cur_pred)
+
+        # also print the predictions for first batch
+        # if k == -1: # disable for now
+        #     num_to_display = 10
+        #     # print the table first
+        #     print("#### KV Table:", input_ids[:num_to_display, :input_ids.shape[1] // 2].view(num_to_display, -1, 2), flush=True)
+        #     # print("Targets:", cur_targets[:num_to_display, :])
+        #     # print("Predictions:", cur_pred[:num_to_display, :])
+        #     t = cur_targets[:num_to_display, :].view(num_to_display, -1, 1)
+        #     p = cur_pred[:num_to_display, :].view(num_to_display, -1, 1)
+        #     prob = cur_probs[:num_to_display, :].view(num_to_display, -1, 1).cpu().numpy().round(3)
+        #     print("(Target, Prediction):", flush=True)
+        #     print(torch.cat((t, p), dim=-1), flush=True)
+        #     print("Probabilities:", flush=True)
+        #     print(prob, flush=True)
+
+        # OLD stuff
+        # val_bar.set_postfix_str(f"accuracy: {(sum(acc) / len(acc)):.4f}")
+        log_str = batch_config["num_kv_pairs"]
+        if log_str not in acc_kv:
+            acc_kv[log_str] = []
+        acc_kv[log_str].append(cur_acc)
+
+    # acc = torch.stack(acc).mean()
+    acc = torch.concat(acc)
+    # predictions = torch.concat(predictions, dim=0)
+
+    if accelerate.is_main_process: # only doing it for the test, where max_iters = -1
+        if split == "val":
+            # log everything to wandb
+            prefix_str = "val/"
+
+            for kv, kv_acc in acc_kv.items():
+                print("KV:", kv, "Accuracy:", torch.concat(kv_acc, dim=0).mean(dim=0).cpu().numpy().round(3), sep=" ")
+                wandb.log({f"{prefix_str}accuracy_{kv}": torch.concat(kv_acc, dim=0).mean()})
+            
+            # plot the accuracy per KV pair
+            # acc_per_pos = acc.mean(dim=0)
+            # for i in range(acc_per_pos.shape[0]):
+            #     wandb.log({f"val_extra/accuracy_token_{i}": acc_per_pos[i].item()})
+        else:
+            # log everything to wandb
+            prefix_str = "train/"
+
+            for kv, kv_acc in acc_kv.items():
+                print("KV:", kv, "Accuracy:", torch.concat(kv_acc, dim=0).mean(dim=0).cpu().numpy().round(3), sep=" ")
+                wandb.log({f"{prefix_str}accuracy_{kv}": torch.concat(kv_acc, dim=0).mean()})
+
+
+            # acc_per_pos = acc.mean(dim=0)
+            # for i in range(acc_per_pos.shape[0]):
+            #     wandb.log({f"train_extra/accuracy_token_{i}": acc_per_pos[i].item()})
+
+    # if accelerate.is_main_process:
+    #     if max_iters == -1:
+    #         # only save for test data
+    #         save_path = os.path.join(cfg.result_dir, f"test_predictions_step_{step:07d}.pt")
+    #         print("Shape of predictions:", predictions.shape, flush=True)
+    #         print("Saving test predictions to:", save_path, flush=True)
+    #         torch.save(predictions, save_path)
+    #     else:
+    #         save_path = os.path.join(cfg.result_dir, f"train_predictions_step_{step:07d}.pt")
+    #         print("Shape of predictions:", predictions.shape, flush=True)
+    #         print("Saving train predictions to:", save_path, flush=True)
+    #         torch.save(predictions, save_path)
+
+    model.train()
+    # return acc
+    return acc.mean()
