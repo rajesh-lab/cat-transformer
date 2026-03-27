@@ -297,9 +297,25 @@ class CATGatedDeltaNet(nn.Module):
         v = self.v_proj(x)
 
         if self.use_short_conv:
-            q = F.silu(self.q_conv(q.transpose(1, 2))[..., :seqlen].transpose(1, 2))
-            k = F.silu(self.k_conv(k.transpose(1, 2))[..., :seqlen].transpose(1, 2))
-            v = F.silu(self.v_conv(v.transpose(1, 2))[..., :seqlen].transpose(1, 2))
+            C = self.cat_block_size
+            pad_len_conv = (C - seqlen % C) % C
+            if pad_len_conv > 0:
+                q = F.pad(q, (0, 0, 0, pad_len_conv))
+                k = F.pad(k, (0, 0, 0, pad_len_conv))
+                v = F.pad(v, (0, 0, 0, pad_len_conv))
+            q = rearrange(q, 'b (nb bs) d -> (b nb) d bs', bs=C)
+            q = F.silu(self.q_conv(q)[..., :C])
+            q = rearrange(q, '(b nb) d bs -> b (nb bs) d', b=bsz)
+            k = rearrange(k, 'b (nb bs) d -> (b nb) d bs', bs=C)
+            k = F.silu(self.k_conv(k)[..., :C])
+            k = rearrange(k, '(b nb) d bs -> b (nb bs) d', b=bsz)
+            v = rearrange(v, 'b (nb bs) d -> (b nb) d bs', bs=C)
+            v = F.silu(self.v_conv(v)[..., :C])
+            v = rearrange(v, '(b nb) d bs -> b (nb bs) d', b=bsz)
+            if pad_len_conv > 0:
+                q = q[:, :seqlen]
+                k = k[:, :seqlen]
+                v = v[:, :seqlen]
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -475,10 +491,18 @@ class CATMamba2(nn.Module):
             [self.intermediate_size, self.conv_dim, self.n_head], dim=-1,
         )
 
+        # apply conv to local tokens only
+        # dont apply conv across chunks
         if self.use_conv:
-            x_BC = F.silu(
-                self.conv1d(x_BC.transpose(1, 2))[..., :seqlen].transpose(1, 2)
-            )
+            C_bs = self.cat_block_size
+            pad_len_conv = (C_bs - seqlen % C_bs) % C_bs
+            if pad_len_conv > 0:
+                x_BC = F.pad(x_BC, (0, 0, 0, pad_len_conv))
+            x_BC = rearrange(x_BC, 'b (nb bs) d -> (b nb) d bs', bs=C_bs)
+            x_BC = F.silu(self.conv1d(x_BC)[..., :C_bs])
+            x_BC = rearrange(x_BC, '(b nb) d bs -> b (nb bs) d', b=bsz)
+            if pad_len_conv > 0:
+                x_BC = x_BC[:, :seqlen]
 
         groups_state_size = self.n_groups * self.state_size
         x_ssm, B, C = x_BC.split(
