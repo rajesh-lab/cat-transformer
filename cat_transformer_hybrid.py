@@ -31,6 +31,7 @@ from transformer import (
     build_rope_cache,
 )
 from cat_transformer import CAT_Config, Compressor, get_cat_mask
+from gated_deltanet import naive_recurrent_gdn_cat, chunk_gdn_cat, chunk_gdn_cat_parallel
 
 from torch.nn.attention.flex_attention import create_block_mask, BlockMask
 create_block_mask = torch.compile(create_block_mask)
@@ -201,13 +202,204 @@ class CATLinearBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# CATGatedDeltaNet — GDN-based drop-in replacement for Attention
+# --------------------------------------------------------------------------- #
+
+class CATGatedDeltaNet(nn.Module):
+    """Gated Delta Network attention with the CAT block-sparse mask.
+
+    Uses L2-normalized Q/K, Mamba-style gated decay, and the two-pass
+    chunked GDN algorithm from gated_deltanet.py.  Three modes:
+      'naive'    — token-by-token  (naive_recurrent_gdn_cat)
+      'chunk'    — two-pass, sequential intra-chunk  (chunk_gdn_cat)
+      'parallel' — two-pass, WY-parallel intra-chunk (chunk_gdn_cat_parallel)
+
+    Following fla & NVlabs references, includes causal depthwise short
+    convolutions on Q/K/V and SiLU output gating.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_idx: int,
+        cat_block_size: int,
+        mode: str = 'parallel',
+        use_short_conv: bool = True,
+        conv_size: int = 4,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.cat_block_size = cat_block_size
+        self.mode = mode
+        assert mode in ('naive', 'chunk', 'parallel')
+
+        self.n_head = config.n_head
+        self.head_dim = config.head_dim
+        self.n_local_heads = config.n_local_heads
+        self.dim = config.dim
+        self.use_short_conv = use_short_conv
+
+        key_dim = config.n_head * config.head_dim
+        kv_dim = config.n_local_heads * config.head_dim
+
+        self.q_proj = nn.Linear(config.dim, key_dim, bias=False)
+        self.k_proj = nn.Linear(config.dim, kv_dim, bias=False)
+        self.v_proj = nn.Linear(config.dim, kv_dim, bias=False)
+
+        if use_short_conv:
+            self.q_conv = nn.Conv1d(
+                key_dim, key_dim, conv_size,
+                padding=conv_size - 1, groups=key_dim, bias=False,
+            )
+            self.k_conv = nn.Conv1d(
+                kv_dim, kv_dim, conv_size,
+                padding=conv_size - 1, groups=kv_dim, bias=False,
+            )
+            self.v_conv = nn.Conv1d(
+                kv_dim, kv_dim, conv_size,
+                padding=conv_size - 1, groups=kv_dim, bias=False,
+            )
+
+        # Mamba-style gated decay: g = -A_log.exp() * softplus(a_proj(x) + dt_bias)
+        self.a_proj = nn.Linear(config.dim, config.n_head, bias=False)
+        A = torch.empty(config.n_head, dtype=torch.float32).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+
+        dt_min, dt_max = 0.001, 0.1
+        dt = torch.exp(
+            torch.rand(config.n_head) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min),
+        )
+        dt = torch.clamp(dt, min=1e-4)
+        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
+        self.dt_bias._no_weight_decay = True
+
+        self.b_proj = nn.Linear(config.dim, config.n_head, bias=True)
+
+        # Output: gate + RMSNorm + projection
+        self.g_proj = nn.Linear(config.dim, key_dim, bias=False)
+        self.o_norm = RMSNorm(config.head_dim, eps=config.norm_eps)
+        self.wo = nn.Linear(key_dim, config.dim, bias=False)
+
+        self.kv_cache: Optional[KVCache] = None
+
+    def forward(
+        self, x: Tensor, cos: Tensor, sin: Tensor,
+        is_causal: bool = True, mask=None, input_pos=None,
+    ) -> Tensor:
+        bsz, seqlen, _ = x.shape
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        if self.use_short_conv:
+            q = F.silu(self.q_conv(q.transpose(1, 2))[..., :seqlen].transpose(1, 2))
+            k = F.silu(self.k_conv(k.transpose(1, 2))[..., :seqlen].transpose(1, 2))
+            v = F.silu(self.v_conv(v.transpose(1, 2))[..., :seqlen].transpose(1, 2))
+
+        q = q.view(bsz, seqlen, self.n_head, self.head_dim)
+        k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+
+        # L2 normalize Q, K
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        # GQA: repeat K/V heads to match Q
+        if self.n_local_heads != self.n_head:
+            n_rep = self.n_head // self.n_local_heads
+            k = k.unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
+            k = k.reshape(bsz, seqlen, self.n_head, self.head_dim)
+            v = v.unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
+            v = v.reshape(bsz, seqlen, self.n_head, self.head_dim)
+
+        g = -self.A_log.float().exp() * F.softplus(
+            self.a_proj(x).float() + self.dt_bias
+        )
+        g = g.to(x.dtype)
+
+        beta = self.b_proj(x).sigmoid()
+
+        C = self.cat_block_size
+        pad_len = (C - seqlen % C) % C
+        if pad_len > 0:
+            q = F.pad(q, (0, 0, 0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, 0, 0, pad_len))
+            g = F.pad(g, (0, 0, 0, pad_len))
+            beta = F.pad(beta, (0, 0, 0, pad_len))
+
+        if self.mode == 'naive':
+            y = naive_recurrent_gdn_cat(q, k, v, g, beta, chunk_size=C)
+        elif self.mode == 'chunk':
+            y = chunk_gdn_cat(q, k, v, g, beta, chunk_size=C)
+        else:
+            y = chunk_gdn_cat_parallel(q, k, v, g, beta, chunk_size=C)
+
+        if pad_len > 0:
+            y = y[:, :seqlen, :, :]
+
+        g_out = self.g_proj(x).view(bsz, seqlen, self.n_head, self.head_dim)
+        y = self.o_norm(y) * F.silu(g_out)
+
+        y = y.contiguous().view(bsz, seqlen, self.dim)
+        return self.wo(y)
+
+
+# --------------------------------------------------------------------------- #
+# CATGatedDeltaNetBlock — TransformerBlock with GDN attention
+# --------------------------------------------------------------------------- #
+
+class CATGatedDeltaNetBlock(nn.Module):
+    """TransformerBlock variant that uses CATGatedDeltaNet + MLP."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_idx: int,
+        cat_block_size: int,
+        mode: str = 'parallel',
+        use_short_conv: bool = True,
+        conv_size: int = 4,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.attention = CATGatedDeltaNet(
+            config, layer_idx, cat_block_size,
+            mode=mode, use_short_conv=use_short_conv, conv_size=conv_size,
+        )
+
+        if config.use_fused_ops:
+            self.feed_forward = LigerSwiGLUMLP(config)
+            self.ffn_norm = LigerRMSNorm(config.dim, eps=config.norm_eps)
+            self.attention_norm = LigerRMSNorm(config.dim, eps=config.norm_eps)
+        else:
+            self.feed_forward = LLaMAMLP(config)
+            self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
+            self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
+
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
+                is_causal: bool = True, mask=None, input_pos=None) -> Tensor:
+        h = x + self.attention(self.attention_norm(x), cos, sin, is_causal, mask=mask, input_pos=input_pos)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
+
+# --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
 
 @dataclass
 class HybridCAT_Config(CAT_Config):
     linear_attn_layers: List[int] = field(default_factory=list)
+    gdn_layers: List[int] = field(default_factory=list)
     use_naive_linear_attn: bool = False
+    gdn_mode: str = 'parallel'
+    gdn_use_short_conv: bool = True
+    gdn_conv_size: int = 4
 
 
 # --------------------------------------------------------------------------- #
@@ -239,7 +431,14 @@ class CAT_Transformer_Hybrid(nn.Module):
         cat_block_size = 1 + config.chunk_size
         self.layers = nn.ModuleList()
         for i in range(config.n_layer):
-            if i in config.linear_attn_layers:
+            if i in config.gdn_layers:
+                self.layers.append(CATGatedDeltaNetBlock(
+                    config, layer_idx=i, cat_block_size=cat_block_size,
+                    mode=config.gdn_mode,
+                    use_short_conv=config.gdn_use_short_conv,
+                    conv_size=config.gdn_conv_size,
+                ))
+            elif i in config.linear_attn_layers:
                 self.layers.append(CATLinearBlock(
                     config, layer_idx=i, cat_block_size=cat_block_size,
                     use_naive=config.use_naive_linear_attn,
@@ -265,9 +464,8 @@ class CAT_Transformer_Hybrid(nn.Module):
 
         self.apply(lambda m: _init_weights(m, self.config.n_layer, self.config.dim))
         self.f.apply(lambda m: _init_weights(m, self.f.config.n_layer, self.f.config.dim))
-        # _init_weights only recognises Attention; scale down wo for CATLinearAttention too
         for layer in self.layers:
-            if isinstance(layer, CATLinearBlock):
+            if isinstance(layer, (CATLinearBlock, CATGatedDeltaNetBlock)):
                 nn.init.normal_(
                     layer.attention.wo.weight,
                     mean=0.0, std=1.0 / math.sqrt(config.dim) / config.n_layer,
@@ -301,7 +499,8 @@ class CAT_Transformer_Hybrid(nn.Module):
 
         n_std = sum(1 for l in self.layers if isinstance(l, TransformerBlock))
         n_lin = sum(1 for l in self.layers if isinstance(l, CATLinearBlock))
-        print(f"Hybrid CAT: {n_std} standard + {n_lin} linear attention layers")
+        n_gdn = sum(1 for l in self.layers if isinstance(l, CATGatedDeltaNetBlock))
+        print(f"Hybrid CAT: {n_std} standard + {n_lin} linear + {n_gdn} GDN layers")
         print("cos shape:", self.cos.shape)
 
     # ---- generation helpers ----
@@ -482,7 +681,7 @@ if __name__ == "__main__":
     model_naive.setup_cache(device=device)
 
     n_params = sum(p.numel() for p in model_chunked.parameters())
-    print(f"Total params: {n_params / 1e6:.1f}M")
+    print(f"Total params (linear hybrid): {n_params / 1e6:.1f}M")
 
     input_ids = torch.randint(0, decoder_config_chunked.vocab_size, (4, block_size), device=device)
     print("input_ids shape:", input_ids.shape)
@@ -498,6 +697,56 @@ if __name__ == "__main__":
     print(f"Max abs diff:  {diff.max().item():.6e}")
     print(f"Mean abs diff: {diff.mean().item():.6e}")
     if diff.max().item() < 1e-2:
-        print("PASS: chunked and naive agree")
+        print("PASS: chunked and naive linear attention agree")
     else:
-        print("WARN: chunked and naive differ significantly")
+        print("WARN: chunked and naive linear attention differ significantly")
+
+    # ------------------------------------------------------------------- #
+    # GDN hybrid: parallel vs naive modes
+    # ------------------------------------------------------------------- #
+    print()
+    print("=" * 70)
+    print("GDN hybrid correctness check (parallel vs naive mode)")
+    print("=" * 70)
+
+    gdn_layers = list(range(0, num_layers, 2))
+
+    decoder_config_gdn_par = HybridCAT_Config(
+        dim=decoder_dim, n_head=n_head_decoder,
+        block_size=block_size, chunk_size=chunk_size,
+        n_layer=num_layers,
+        gdn_layers=gdn_layers,
+        gdn_mode='parallel',
+    )
+    decoder_config_gdn_naive = HybridCAT_Config(
+        dim=decoder_dim, n_head=n_head_decoder,
+        block_size=block_size, chunk_size=chunk_size,
+        n_layer=num_layers,
+        gdn_layers=gdn_layers,
+        gdn_mode='naive',
+    )
+
+    model_gdn_par = CAT_Transformer_Hybrid(decoder_config_gdn_par, compressor_config)
+    model_gdn_par = model_gdn_par.to(device=device)
+    model_gdn_par.setup_cache(device=device)
+
+    model_gdn_naive = CAT_Transformer_Hybrid(decoder_config_gdn_naive, compressor_config)
+    model_gdn_naive.load_state_dict(model_gdn_par.state_dict())
+    model_gdn_naive = model_gdn_naive.to(device=device)
+    model_gdn_naive.setup_cache(device=device)
+
+    n_params_gdn = sum(p.numel() for p in model_gdn_par.parameters())
+    print(f"Total params (GDN hybrid): {n_params_gdn / 1e6:.1f}M")
+    print(f"GDN layers: {gdn_layers}")
+
+    with torch.no_grad():
+        logits_gdn_par = model_gdn_par(input_ids)
+        logits_gdn_naive = model_gdn_naive(input_ids)
+
+    diff_gdn = (logits_gdn_par - logits_gdn_naive).abs()
+    print(f"Max abs diff (parallel vs naive):  {diff_gdn.max().item():.6e}")
+    print(f"Mean abs diff (parallel vs naive): {diff_gdn.mean().item():.6e}")
+    if diff_gdn.max().item() < 1e-2:
+        print("PASS: GDN parallel and naive agree")
+    else:
+        print("WARN: GDN parallel and naive differ significantly")

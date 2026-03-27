@@ -29,6 +29,8 @@ Shapes:
   state: [B, H, K, V]
 """
 
+import math
+
 import torch
 from torch import Tensor, einsum
 from einops import rearrange
@@ -374,6 +376,140 @@ def chunk_gdn(
     return torch.cat(o_chunks, dim=1)
 
 
+# --------------------------------------------------------------------------- #
+# 7b. Two-pass chunked — Gated DeltaNet (WY-parallel intra-chunk)
+# --------------------------------------------------------------------------- #
+
+@torch.compile
+def _parallel_scan_linear(Phi: Tensor, u: Tensor) -> Tensor:
+    """Hillis-Steele parallel prefix scan for the matrix linear recurrence
+        S_i = Phi_i @ S_{i-1} + u_i,   S_0 = 0.
+
+    Args:
+        Phi: (B, NC, H, K, K)  transition matrices per chunk
+        u:   (B, NC, H, K, V)  input vectors per chunk
+
+    Returns:
+        states: (B, NC, H, K, V) — state BEFORE each chunk (exclusive prefix).
+    """
+    B, NC, H, K, V = u.shape
+
+    Phi_cur = Phi.clone()
+    u_cur = u.clone()
+
+    n_steps = math.ceil(math.log2(NC)) if NC > 1 else 0
+    for d in range(n_steps):
+        stride = 1 << d
+        if stride >= NC:
+            break
+        Phi_prev = Phi_cur[:, :NC - stride]
+        u_prev = u_cur[:, :NC - stride]
+
+        new_Phi = torch.matmul(Phi_cur[:, stride:], Phi_prev)
+        new_u = torch.matmul(Phi_cur[:, stride:], u_prev) + u_cur[:, stride:]
+
+        Phi_cur = torch.cat([Phi_cur[:, :stride], new_Phi], dim=1)
+        u_cur = torch.cat([u_cur[:, :stride], new_u], dim=1)
+
+    # u_cur is now the inclusive scan (S_after_chunk_i).
+    # Shift right to get exclusive prefix (S_before_chunk_i).
+    return torch.cat([u.new_zeros(B, 1, H, K, V), u_cur[:, :-1]], dim=1)
+
+
+@torch.compile
+def _gdn_pass2(q_h, k_h, v_h, states, W, U, exp_G_h):
+    """Pass 2: compute all chunk outputs in parallel using WY (compiled)."""
+    C = q_h.shape[-2]
+    V_corr = U - torch.matmul(W, states)
+    inter = torch.matmul(q_h, states)
+
+    QK = torch.matmul(q_h, k_h.transpose(-1, -2))
+    causal = torch.tril(torch.ones(C, C, device=q_h.device, dtype=torch.bool))
+    QK = QK.masked_fill(~causal, 0.0)
+    intra = torch.matmul(QK, V_corr)
+
+    return exp_G_h.unsqueeze(-1) * (inter + intra)
+
+
+def chunk_gdn_parallel(
+    q: Tensor, k: Tensor, v: Tensor,
+    g: Tensor, beta: Tensor,
+    scale: float | None = None,
+    chunk_size: int = 16,
+) -> Tensor:
+    """Two-pass chunked gated delta rule — fully parallel.
+
+    Same result as chunk_gdn / naive_recurrent_gdn, but replaces the
+    double sequential loop (NC × C) with:
+      - WY/UT computation for all chunks in parallel  (intra-chunk)
+      - Hillis-Steele parallel prefix scan             (inter-chunk)
+      - Parallel output computation for all chunks
+
+    The per-chunk transition is a K×K matrix linear recurrence:
+        S_i = Φ_i · S_{i-1} + u_i
+    where Φ_i = exp(G_last_i) · (I − kᵀ W_i)  and  u_i = exp(G_last_i) · ψ_i.
+    This is solved in O(log NC) parallel steps via a Hillis-Steele scan
+    with K×K batched matmuls.
+    """
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+    B, T, H, K_dim = q.shape
+    V_dim = v.shape[-1]
+    C = chunk_size
+    NC = T // C
+
+    q_c = rearrange(q, 'b (nc c) h k -> b nc c h k', c=C)
+    k_c = rearrange(k, 'b (nc c) h k -> b nc c h k', c=C)
+    v_c = rearrange(v, 'b (nc c) h v -> b nc c h v', c=C)
+    g_c = rearrange(g, 'b (nc c) h -> b nc c h', c=C)
+    beta_c = rearrange(beta, 'b (nc c) h -> b nc c h', c=C)
+
+    q_h = rearrange(q_c, 'b n c h k -> b n h c k') * scale
+    k_h = rearrange(k_c, 'b n c h k -> b n h c k')
+    v_h = rearrange(v_c, 'b n c h v -> b n h c v')
+
+    # --- WY computation (all chunks in parallel) ---
+    G_c = g_c.cumsum(dim=2)
+    exp_G_h = G_c.exp().permute(0, 1, 3, 2)                         # (B, NC, H, C)
+    alpha_c = g_c.exp()
+
+    bt_h = (beta_c / alpha_c).permute(0, 1, 3, 2)                   # β̃ = β/exp(g)
+    bh_h = (beta_c / G_c.exp()).permute(0, 1, 3, 2)                 # β̂ = β/exp(G)
+
+    KK = torch.matmul(k_h, k_h.transpose(-1, -2))                   # (B, NC, H, C, C)
+    A = -(bt_h.unsqueeze(-1) * KK)
+    strict_lower = torch.tril(torch.ones(C, C, device=q.device, dtype=torch.bool), diagonal=-1)
+    A = A * strict_lower
+
+    I_C = torch.eye(C, device=q.device, dtype=q.dtype).expand_as(A)
+    T_mat = I_C
+    for _ in range(C - 1):
+        T_mat = I_C + torch.matmul(A, T_mat)
+
+    W = torch.matmul(T_mat * bt_h.unsqueeze(-2), k_h)               # (B, NC, H, C, K)
+    U = torch.matmul(T_mat * bh_h.unsqueeze(-2), v_h)               # (B, NC, H, C, V)
+
+    # --- Build per-chunk transition (Φ_i, u_i) for the linear recurrence ---
+    # Φ_i = exp(G_last_i) · (I_K − kᵀ W_i)              (B, NC, H, K, K)
+    # u_i = exp(G_last_i) · ψ_i = exp(G_last_i) · kᵀ U  (B, NC, H, K, V)
+    kW = torch.matmul(k_h.transpose(-1, -2), W)                     # (B, NC, H, K, K)
+    exp_G_last = exp_G_h[..., -1]                                    # (B, NC, H)
+    exp_G_last_mm = exp_G_last[..., None, None]                      # (B, NC, H, 1, 1)
+
+    I_K = torch.eye(K_dim, device=q.device, dtype=q.dtype)
+    Phi = exp_G_last_mm * (I_K - kW)                                 # (B, NC, H, K, K)
+
+    psi = torch.matmul(k_h.transpose(-1, -2), U)                    # (B, NC, H, K, V)
+    u = exp_G_last_mm * psi                                          # (B, NC, H, K, V)
+
+    # --- Parallel inter-chunk state propagation (Hillis-Steele scan) ---
+    states = _parallel_scan_linear(Phi, u)                           # (B, NC, H, K, V)
+
+    # --- Parallel output computation ---
+    o_h = _gdn_pass2(q_h, k_h, v_h, states, W, U, exp_G_h)
+    return rearrange(o_h, 'b n h c v -> b (n c) h v')
+
+
 # =========================================================================== #
 # CAT-masked Gated Delta Rule
 #
@@ -514,6 +650,48 @@ def chunk_gdn_cat(
 # 10. Two-pass chunked — CAT-masked Gated DeltaNet (WY-parallel intra-chunk)
 # --------------------------------------------------------------------------- #
 
+@torch.compile
+def _gdn_cat_pass1_step(S, k0, a0, b0, kv0):
+    """Single step of the inter-chunk delta rule recurrence (compiled)."""
+    Sk0 = (S * k0.unsqueeze(-1)).sum(-2)
+    return a0 * S + kv0 - b0 * k0.unsqueeze(-1) * Sk0.unsqueeze(-2)
+
+
+@torch.compile
+def _gdn_cat_pass2(q_h, k_h, v_h, states, g_c, beta_c):
+    """Pass 2: WY + UT parallel computation (compiled)."""
+    C = q_h.shape[-2]
+    G_c = g_c.cumsum(dim=2)
+    exp_G_h = G_c.exp().permute(0, 1, 3, 2)
+    alpha_c = g_c.exp()
+
+    bt_h = (beta_c / alpha_c).permute(0, 1, 3, 2)
+    bh_h = (beta_c / G_c.exp()).permute(0, 1, 3, 2)
+
+    KK = torch.matmul(k_h, k_h.transpose(-1, -2))
+    A = -(bt_h.unsqueeze(-1) * KK)
+    strict_lower = torch.tril(torch.ones(C, C, device=q_h.device, dtype=torch.bool), diagonal=-1)
+    A = A * strict_lower
+
+    I_C = torch.eye(C, device=q_h.device, dtype=q_h.dtype).expand_as(A)
+    T = I_C
+    for _ in range(C - 1):
+        T = I_C + torch.matmul(A, T)
+
+    W = torch.matmul(T * bt_h.unsqueeze(-2), k_h)
+    U = torch.matmul(T * bh_h.unsqueeze(-2), v_h)
+
+    V_corr = U - torch.matmul(W, states)
+    inter = torch.matmul(q_h, states)
+
+    QK = torch.matmul(q_h, k_h.transpose(-1, -2))
+    causal = torch.tril(torch.ones(C, C, device=q_h.device, dtype=torch.bool))
+    QK = QK.masked_fill(~causal, 0.0)
+    intra = torch.matmul(QK, V_corr)
+
+    return exp_G_h.unsqueeze(-1) * (inter + intra)
+
+
 def chunk_gdn_cat_parallel(
     q: Tensor, k: Tensor, v: Tensor,
     g: Tensor, beta: Tensor,
@@ -530,6 +708,10 @@ def chunk_gdn_cat_parallel(
         Ŝ_j = exp(-G_j) S_j,   G_j = cumsum(g)[j]
     whose transition matrix becomes (I − β̃ k kᵀ) with β̃ = β/exp(g),
     admitting a WY factorisation.  The input coefficient becomes β̂ = β/exp(G).
+
+    All operations run in the input dtype (bfloat16-friendly).  The CxC
+    triangular inverse uses a Neumann series (exact for nilpotent A)
+    instead of solve_triangular, avoiding any float32 promotion.
     """
     if scale is None:
         scale = q.shape[-1] ** -0.5
@@ -545,72 +727,33 @@ def chunk_gdn_cat_parallel(
     beta_c = rearrange(beta, 'b (nc c) h -> b nc c h', c=C)
 
     # --- Pass 1: S_inter at each chunk boundary (first tokens only) ---
-    states = []
-    S_inter = q.new_zeros(B, H, K_dim, V_dim)
+    # Pre-extract all first-token quantities to avoid per-iteration indexing.
+    k0_all = k_c[:, :, 0]                                         # (B, NC, H, K)
+    a0_all = g_c[:, :, 0].exp()                                   # (B, NC, H)
+    b0_all = beta_c[:, :, 0]                                      # (B, NC, H)
+    # Pre-compute β·k⊗v for each chunk's first token
+    kv0_all = (b0_all.unsqueeze(-1).unsqueeze(-1)
+               * k0_all.unsqueeze(-1) * v_c[:, :, 0].unsqueeze(-2))  # (B, NC, H, K, V)
+
+    # Pre-expand decay/beta dims for the compiled step function
+    a0_exp = a0_all[:, :, :, None, None]                             # (B, NC, H, 1, 1)
+    b0_exp = b0_all[:, :, :, None, None]                             # (B, NC, H, 1, 1)
+
+    states = q.new_zeros(B, NC, H, K_dim, V_dim)
+    S = q.new_zeros(B, H, K_dim, V_dim)
     for i in range(NC):
-        states.append(S_inter)
-        k0 = k_c[:, i, 0]
-        v0 = v_c[:, i, 0]
-        a0 = g_c[:, i, 0].exp()
-        b0 = beta_c[:, i, 0]
-        Sk0 = einsum('b h k v, b h k -> b h v', S_inter, k0)
-        d0 = v0 - Sk0
-        S_inter = (a0[:, :, None, None] * S_inter
-                   + b0[:, :, None, None] * einsum('b h k, b h v -> b h k v', k0, d0))
-    states = torch.stack(states, dim=1)  # (B, NC, H, K, V)
+        states[:, i] = S
+        S = _gdn_cat_pass1_step(
+            S, k0_all[:, i], a0_exp[:, i], b0_exp[:, i], kv0_all[:, i],
+        )
 
-    # --- Pass 2: WY + UT parallel computation ---
-    # All decay / WY math in fp32 (matching fla & NVlabs reference impls),
-    # cast back to input dtype at the end.
-    orig_dtype = q.dtype
+    # --- Pass 2: WY + UT parallel computation (compiled) ---
+    q_h = rearrange(q_c, 'b n c h k -> b n h c k') * scale
+    k_h = rearrange(k_c, 'b n c h k -> b n h c k')
+    v_h = rearrange(v_c, 'b n c h v -> b n h c v')
 
-    q_h = rearrange(q_c, 'b n c h k -> b n h c k').float() * scale
-    k_h = rearrange(k_c, 'b n c h k -> b n h c k').float()
-    v_h = rearrange(v_c, 'b n c h v -> b n h c v').float()
-    states_f = states.float()
-
-    g_f = g_c.float()
-    beta_f = beta_c.float()
-
-    # Cumulative log-decay within each chunk
-    G_c = g_f.cumsum(dim=2)                                        # (B, NC, C, H)
-    exp_G = rearrange(G_c.exp(), 'b n c h -> b n h c')            # (B, NC, H, C)
-    alpha_c = g_f.exp()                                            # (B, NC, C, H)
-
-    # Adjusted betas for the normalised recurrence
-    bt = rearrange(beta_f / alpha_c, 'b n c h -> b n h c')        # β̃ = β/α
-    bh = rearrange(beta_f / G_c.exp(), 'b n c h -> b n h c')      # β̂ = β/exp(G)
-
-    # --- UT transform ---
-    # Adjacency: A[j,t] = −β̃_j (k_j · k_t),  strictly lower triangular
-    KK = torch.matmul(k_h, k_h.transpose(-1, -2))                 # (B, NC, H, C, C)
-    A = -(bt.unsqueeze(-1) * KK)                                   # row j scaled by β̃_j
-    strict_lower = torch.tril(torch.ones(C, C, device=q.device, dtype=torch.bool), diagonal=-1)
-    A = A * strict_lower
-
-    # T = (I − A)^{−1}  via lower-triangular solve
-    I_C = torch.eye(C, device=q.device, dtype=torch.float32).expand_as(A)
-    T = torch.linalg.solve_triangular(I_C - A, I_C, upper=False)  # (B, NC, H, C, C)
-
-    # W = T diag(β̃) K   and   U = T diag(β̂) V
-    W = torch.matmul(T * bt.unsqueeze(-2), k_h)                   # (B, NC, H, C, K)
-    U = torch.matmul(T * bh.unsqueeze(-2), v_h)                   # (B, NC, H, C, V)
-
-    # Corrected values: Ṽ = U − W S_inter
-    V_corr = U - torch.matmul(W, states_f)                        # (B, NC, H, C, V)
-
-    # Inter-chunk: Q S_inter
-    inter = torch.matmul(q_h, states_f)                            # (B, NC, H, C, V)
-
-    # Intra-chunk: tril(Q Kᵀ) Ṽ
-    QK = torch.matmul(q_h, k_h.transpose(-1, -2))                 # (B, NC, H, C, C)
-    causal = torch.tril(torch.ones(C, C, device=q.device, dtype=torch.bool))
-    QK = QK.masked_fill(~causal, 0.0)
-    intra = torch.matmul(QK, V_corr)                              # (B, NC, H, C, V)
-
-    # Apply cumulative decay and cast back
-    o = exp_G.unsqueeze(-1) * (inter + intra)                      # (B, NC, H, C, V)
-    return rearrange(o, 'b n h c v -> b (n c) h v').to(orig_dtype)
+    o_h = _gdn_cat_pass2(q_h, k_h, v_h, states, g_c, beta_c)
+    return rearrange(o_h, 'b n h c v -> b (n c) h v')
 
 
 # --------------------------------------------------------------------------- #
@@ -652,9 +795,10 @@ def _l2_normalize(x: Tensor) -> Tensor:
 
 
 if __name__ == '__main__':
+    torch.set_float32_matmul_precision('high')
     torch.manual_seed(42)
     B, T, H, K, V = 2, 1024, 4, 64, 64
-    chunk_size = 8
+    chunk_size = 16
     device = 'cuda'
 
     q = torch.randn(B, T, H, K, device=device)
@@ -690,8 +834,10 @@ if __name__ == '__main__':
     print()
     o_gdn_naive = naive_recurrent_gdn(q_n, k_n, v, g, beta)
     o_gdn_chunk = chunk_gdn(q_n, k_n, v, g, beta, chunk_size=chunk_size)
+    o_gdn_par   = chunk_gdn_parallel(q_n, k_n, v, g, beta, chunk_size=chunk_size)
     print("Gated DeltaNet (L2-normed q, k):")
-    print(f"  chunk  vs naive: max err = {(o_gdn_chunk - o_gdn_naive).abs().max().item():.2e}")
+    print(f"  chunk    vs naive: max err = {(o_gdn_chunk - o_gdn_naive).abs().max().item():.2e}")
+    print(f"  parallel vs naive: max err = {(o_gdn_par - o_gdn_naive).abs().max().item():.2e}")
 
     o_gdn_naive_cat = naive_recurrent_gdn_cat(q_n, k_n, v, g, beta, chunk_size=chunk_size)
     o_gdn_chunk_cat = chunk_gdn_cat(q_n, k_n, v, g, beta, chunk_size=chunk_size)
@@ -723,10 +869,10 @@ if __name__ == '__main__':
     la_benches = [
         ("naive_recurrent",       naive_recurrent,       {}),
         ("chunk_linear_attn",     chunk_linear_attn,     {"chunk_size": chunk_size}),
-        ("fused_chunk_linear",    fused_chunk_linear_attn, {"chunk_size": chunk_size}),
-        ("reference_cat (quad)",  reference_cat_attn,    {"chunk_size": chunk_size}),
-        ("naive_recurrent_cat",   naive_recurrent_cat,   {"chunk_size": chunk_size}),
-        ("chunk_linear_attn_cat", chunk_linear_attn_cat, {"chunk_size": chunk_size}),
+        # ("fused_chunk_linear",    fused_chunk_linear_attn, {"chunk_size": chunk_size}),
+        # ("reference_cat (quad)",  reference_cat_attn,    {"chunk_size": chunk_size}),
+        # ("naive_recurrent_cat",   naive_recurrent_cat,   {"chunk_size": chunk_size}),
+        # ("chunk_linear_attn_cat", chunk_linear_attn_cat, {"chunk_size": chunk_size}),
     ]
 
     results = {}
@@ -739,10 +885,11 @@ if __name__ == '__main__':
 
     print("\nGated DeltaNet:")
     gdn_benches = [
-        ("naive_recurrent_gdn",     naive_recurrent_gdn,     {}),
-        ("chunk_gdn",               chunk_gdn,               {"chunk_size": chunk_size}),
-        ("naive_recurrent_gdn_cat", naive_recurrent_gdn_cat, {"chunk_size": chunk_size}),
-        ("chunk_gdn_cat",           chunk_gdn_cat,           {"chunk_size": chunk_size}),
+        # ("naive_recurrent_gdn",     naive_recurrent_gdn,     {}),
+        # ("chunk_gdn",               chunk_gdn,               {"chunk_size": chunk_size}),
+        ("chunk_gdn_parallel",      chunk_gdn_parallel,      {"chunk_size": chunk_size}),
+        # ("naive_recurrent_gdn_cat", naive_recurrent_gdn_cat, {"chunk_size": chunk_size}),
+        # ("chunk_gdn_cat",           chunk_gdn_cat,           {"chunk_size": chunk_size}),
         ("chunk_gdn_cat_parallel",  chunk_gdn_cat_parallel,  {"chunk_size": chunk_size}),
     ]
 

@@ -55,6 +55,13 @@ def main():
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp32", "fp16", "bf16"])
     parser.add_argument("--linear_frac", type=float, default=0.5,
                         help="Fraction of layers that use linear attention (0.0 = all standard, 1.0 = all linear)")
+    parser.add_argument("--gdn_frac", type=float, default=0.5,
+                        help="Fraction of layers that use GDN attention (0.0 = skip GDN, 1.0 = all GDN)")
+    parser.add_argument("--gdn_mode", type=str, default="parallel",
+                        choices=["naive", "chunk", "parallel"],
+                        help="GDN intra-chunk mode")
+    parser.add_argument("--no_short_conv", action="store_true",
+                        help="Disable short convolutions in GDN layers")
     args = parser.parse_args()
 
     device = "cuda"
@@ -75,6 +82,16 @@ def main():
         step = args.num_layers / n_linear
         linear_layers = [int(i * step) for i in range(n_linear)]
 
+    # decide which layers are GDN (same spacing logic)
+    n_gdn = max(0, min(args.num_layers, round(args.num_layers * args.gdn_frac)))
+    if n_gdn == 0:
+        gdn_layers = []
+    elif n_gdn == args.num_layers:
+        gdn_layers = list(range(args.num_layers))
+    else:
+        step_g = args.num_layers / n_gdn
+        gdn_layers = [int(i * step_g) for i in range(n_gdn)]
+
     print("=" * 70)
     print("Parallel vs Hybrid CAT — Training Throughput")
     print("=" * 70)
@@ -83,6 +100,7 @@ def main():
     print(f"  batch_size={args.batch_size}  dtype={args.dtype}")
     print(f"  warmup={args.warmup}  steps={args.steps}")
     print(f"  linear_frac={args.linear_frac}  → linear layers: {linear_layers}")
+    print(f"  gdn_frac={args.gdn_frac}  → GDN layers: {gdn_layers}  mode={args.gdn_mode}")
     print("=" * 70)
 
     decoder_dim = 2 * args.dim
@@ -115,6 +133,15 @@ def main():
         use_naive_linear_attn=True,
     )
 
+    gdn_config = HybridCAT_Config(
+        dim=decoder_dim, n_head=n_head_decoder,
+        block_size=args.block_size, chunk_size=args.chunk_size,
+        n_layer=args.num_layers,
+        gdn_layers=gdn_layers,
+        gdn_mode=args.gdn_mode,
+        gdn_use_short_conv=not args.no_short_conv,
+    )
+
     # synthetic data (kept on GPU across runs)
     input_ids = torch.randint(
         0, parallel_config.vocab_size,
@@ -136,9 +163,12 @@ def main():
 
     model_specs = [
         ("Parallel",     parallel_config),
-        ("Hybrid",       hybrid_config),
-        ("Hybrid-Naive", naive_config),
     ]
+    if linear_layers:
+        # model_specs.append(("Hybrid-Linear",       hybrid_config))
+        # model_specs.append(("Hybrid-Lin-Naive", naive_config))
+    if gdn_layers:
+        model_specs.append(("Hybrid-GDN", gdn_config))
 
     # --- benchmark each model independently for accurate memory ---
     results = {}
@@ -184,36 +214,37 @@ def main():
         torch.cuda.empty_cache()
 
     # --- summary ---
-    tags = ["Parallel", "Hybrid", "Hybrid-Naive"]
+    tags = [name for name, _ in model_specs]
     p = results["Parallel"]
 
     print("\n" + "=" * 70)
     print("Summary — Throughput")
     print("=" * 70)
+    w = max(len(t) for t in tags)
     for tag in tags:
         r = results[tag]
         ratio_str = ""
         if tag != "Parallel":
             ratio = r["avg_ms"] / p["avg_ms"]
             ratio_str = f"  ({ratio:.2f}x {'slower' if ratio > 1 else 'faster'} than Parallel)"
-        print(f"  {tag:>12s} : {r['avg_ms']:8.1f} ms/step  |  {r['throughput']:10.0f} tok/s{ratio_str}")
+        print(f"  {tag:>{w}s} : {r['avg_ms']:8.1f} ms/step  |  {r['throughput']:10.0f} tok/s{ratio_str}")
 
     print()
     target_tokens = 5e9
     for tag in tags:
         r = results[tag]
         hrs = target_tokens / r["throughput"] / 3600
-        print(f"  {tag:>12s} time to 5B tokens: {hrs:8.1f} hrs  ({hrs/24:.1f} days)")
+        print(f"  {tag:>{w}s} time to 5B tokens: {hrs:8.1f} hrs  ({hrs/24:.1f} days)")
 
     print("\n" + "=" * 70)
     print("Summary — Memory")
     print("=" * 70)
-    print(f"  {'Model':>12s}   {'Params':>8s}   {'Weights+Optim':>13s}   {'Peak Train':>10s}   {'Activations':>11s}")
-    print(f"  {'-'*12}   {'-'*8}   {'-'*13}   {'-'*10}   {'-'*11}")
+    print(f"  {'Model':>{w}s}   {'Params':>8s}   {'Weights+Optim':>13s}   {'Peak Train':>10s}   {'Activations':>11s}")
+    print(f"  {'-'*w}   {'-'*8}   {'-'*13}   {'-'*10}   {'-'*11}")
     for tag in tags:
         r = results[tag]
         act_mem = r["peak_mem_gib"] - r["mem_model_gib"]
-        print(f"  {tag:>12s}   {fmt_num(r['n_params']):>8s}   {r['mem_model_gib']:10.2f} GiB"
+        print(f"  {tag:>{w}s}   {fmt_num(r['n_params']):>8s}   {r['mem_model_gib']:10.2f} GiB"
               f"   {r['peak_mem_gib']:7.2f} GiB   {act_mem:8.2f} GiB")
 
     print("=" * 70)
