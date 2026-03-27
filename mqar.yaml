@@ -15,7 +15,8 @@ dataset:
     name: mqar
 
     # we will have to use a standard dataloader for this!
-    path: /gpfs/data/ranganathlab/Jatin/Datasets/mqar/kv_4_8_16_32_64_seqlen_256
+    # path: /gpfs/data/ranganathlab/Jatin/Datasets/mqar/kv_4_8_16_32_64_seqlen_256
+    path: /gpfs/data/ranganathlab/Jatin/Datasets/mqar/kv_4_8_16_32_64_128_256_seqlen_1024_100k_20k
     # tokenizer_name: "gpt2" # there is no toknizer here
     tokenizer_name: null
     vocab_size: 8192

@@ -150,6 +150,11 @@ def main(cfg: DictConfig):
     
     accelerate.wait_for_everyone()
 
+    grad_accum = cfg.train.grad_accum
+    optimizer_steps = cfg.train.train_iters // grad_accum
+    accelerate.print(f"Gradient accumulation steps: {grad_accum}")
+    accelerate.print(f"Optimizer steps in this training: {optimizer_steps:,}")
+
     # training loop
     bar = tqdm(range(cfg.train.train_iters), desc="Training", disable=(not accelerate.is_main_process))
     for iter_num in bar:
@@ -157,7 +162,8 @@ def main(cfg: DictConfig):
 
         start_time = time.time()
 
-        optimizer.zero_grad()
+        if iter_num % grad_accum == 0:
+            optimizer.zero_grad()
 
         lr = get_lr(optimizer.defaults["lr"], iter_num, warmup_steps, cfg.train.train_iters, cfg.optimizer.min_lr)
         for param_group in optimizer.param_groups:
@@ -166,20 +172,22 @@ def main(cfg: DictConfig):
         with accelerate.autocast():
             if is_cat:
                 chunk_size_power = chunk_size_powers[iter_num % len(chunk_size_powers)]
-                loss = model(input_ids, targets, chunk_size_power=chunk_size_power)
+                original_loss = model(input_ids, targets, chunk_size_power=chunk_size_power)
             else:
-                loss = model(input_ids, targets)
+                original_loss = model(input_ids, targets)
+            loss = original_loss / grad_accum
 
         accelerate.backward(loss)
 
-        if torch.isnan(loss):
+        if torch.isnan(original_loss):
             accelerate.print("Loss is NaN. Exiting...", flush=True)
             exit(1)
 
-        if cfg.train.grad_norm > 0:
-            accelerate.clip_grad_norm_(model.parameters(), max_norm=cfg.train.grad_norm)
+        if (iter_num + 1) % grad_accum == 0:
+            if cfg.train.grad_norm > 0:
+                accelerate.clip_grad_norm_(model.parameters(), max_norm=cfg.train.grad_norm)
 
-        optimizer.step()
+            optimizer.step()
 
         time_taken = time.time() - start_time
         token_throughput = input_ids.shape[0] * input_ids.shape[1] / time_taken / 1000
@@ -187,13 +195,13 @@ def main(cfg: DictConfig):
         if accelerate.is_main_process:
             wandb.log({
                 "train/lr": optimizer.param_groups[0]['lr'], 
-                "train/loss": loss.item(),
+                "train/loss": original_loss.item(),
                 "perf/Ktokens_s": token_throughput,
             })
             log_str = f'train/loss_num_kv_pairs_{batch_config["num_kv_pairs"]}'
-            wandb.log({log_str: loss.item()})
+            wandb.log({log_str: original_loss.item()})
 
-        bar.set_postfix_str(f"loss: {loss.item():.4f}; lr: {lr:.6f}; {token_throughput:.2f}K tokens/s;")
+        bar.set_postfix_str(f"loss: {original_loss.item():.4f}; lr: {lr:.6f}; {token_throughput:.2f}K tokens/s;")
 
         if (iter_num % cfg.eval.eval_interval == 0) and (iter_num > 0):
             eval_chunk_power = chunk_size_powers[-1] if is_cat else None

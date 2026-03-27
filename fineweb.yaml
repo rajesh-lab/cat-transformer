@@ -14,7 +14,7 @@ seed: 42
 dataset:
     name: fineweb
 
-    path: /scratch/jp7467/cat-transformer/dataset/fineweb-10b
+    path: /gpfs/data/ranganathlab/Jatin/Datasets/new-fineweb-5b-gpt2
     tokenizer_name: "gpt2"
     vocab_size: 50257
 
@@ -93,8 +93,8 @@ optimizer:
 # don't change this, it will be set by the script
 result_dir:
 
-# choose from [transformer, cat_transformer]
-model_type: transformer
+# choose from [transformer, cat_transformer, cat_transformer_hybrid]
+model_type: cat_transformer_hybrid
 
 transformer:
     name: transformer
@@ -128,6 +128,46 @@ cat_transformer:
     compressor_dim: 768
     compressor_n_head: 12
     compressor_n_layer: 3
+
+
+cat_transformer_hybrid:
+    name: cat_transformer_hybrid
+
+    block_size: 2048
+    chunk_size: 16
+
+    use_fused_ops: True
+    use_qk_norm: True
+
+    # decoder
+    n_layer: 12
+    dim: 1536
+    n_head: 12
+
+    dim_fx: 1536
+
+    # compressor
+    compressor_dim: 768
+    compressor_n_head: 12
+    compressor_n_layer: 3
+
+    # hybrid layer assignment (indices of layers using each attention type)
+    # layers not listed here use standard softmax attention
+    gdn_layers: []
+    linear_attn_layers: []
+    mamba2_layers: [1, 3, 5, 7, 9, 11]
+
+    # mamba2 options
+    mamba2_mode: parallel
+    mamba2_state_size: 64
+    mamba2_n_groups: 1
+    mamba2_conv_kernel: 4
+    mamba2_use_conv: True
+
+    # gdn options
+    gdn_mode: parallel
+    gdn_use_short_conv: True
+    gdn_conv_size: 4
 
 
 # Populate the model settings based on selection in model_type
