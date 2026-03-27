@@ -4,9 +4,9 @@ lm-evaluation-harness wrapper for Transformer and CAT_Transformer models.
 Usage:
     python eval/harness.py --model_type chunked --tasks hellaswag,arc_easy
 
-    python eval/harness.py --model_type vanilla2 --chunk_size_power 2 \
-    --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_1,niah_single_3 --metadata '{"max_seq_lengths":[2048,4096]}' \
-    --limit 10 --output_path eval/test.json
+    python eval/harness.py --model_type chunked --chunk_size_power 2 \
+    --tasks niah_single_1,niah_single_2,niah_single_3 --metadata '{"max_seq_lengths":[4096]}' \
+    --limit 50 --output_path eval/test.json
 
     python eval/harness.py --model_type chunked --chunk_size_power 3 --tasks niah_single_1 --metadata '{"max_seq_lengths":[1024]}' --output_path eval/test.json
 
@@ -53,6 +53,8 @@ MODEL_TYPE_TO_PATH = {
     # gpt2 -- 15B tokens, 4K context, D=1024
     "vanilla" : "/scratch/jp7467/cat-transformer/Results/fineweb-15b/2026-03-16/13:24:52.608318/state_dict.pt", # 12L
     "vanilla2" : "/scratch/jp7467/cat-transformer/Results/fineweb-15b/2026-03-16/13:34:38.920977/state_dict.pt", # 24L
+
+    "chunked" : "/scratch/jp7467/cat-transformer/Results/fineweb-15b/2026-03-20/00:35:07.052056/state_dict.pt",
 }
 
 TOKENIZER_NAME = "gpt2"
