@@ -28,6 +28,33 @@ from cat_transformer_adaptive import (
     CAT_Transformer
 )
 
+from cat_transformer import CAT_Config as CAT_Config_Fixed
+from cat_transformer_hybrid import (
+    HybridCAT_Config,
+    CAT_Transformer_Hybrid,
+)
+
+
+def _make_compressor_config(cfg):
+    """Build compressor config shared by cat_transformer and cat_transformer_hybrid."""
+    return CAT_Config_Fixed(
+        vocab_size=cfg.dataset.vocab_size,
+        block_size=cfg.model.block_size,
+
+        use_fused_ops=False,  # liger-kernels doesn't support vmaps
+        use_qk_norm=cfg.model.use_qk_norm,
+
+        chunk_size=cfg.model.chunk_size,
+
+        dim=cfg.model.compressor_dim,
+        n_head=cfg.model.compressor_n_head,
+        n_layer=cfg.model.compressor_n_layer,
+        
+        norm_eps=cfg.train.norm_eps,
+
+        dim_fx=cfg.model.dim_fx,
+    )
+
 
 def get_model(accelerate: Accelerator, cfg):
     # pass hyperparameters from the yaml config file to the transformer config
@@ -37,9 +64,11 @@ def get_model(accelerate: Accelerator, cfg):
         config = TransformerConfig(
             vocab_size=cfg.dataset.vocab_size,
             block_size=cfg.model.block_size,
+
             n_layer=cfg.model.n_layer,
             dim=cfg.model.dim,
             n_head=cfg.model.n_head,
+
             norm_eps=cfg.train.norm_eps,
 
             use_fused_ops=cfg.model.use_fused_ops,
@@ -53,33 +82,33 @@ def get_model(accelerate: Accelerator, cfg):
     elif "cat_transformer" == cfg.model.name:
 
         compressor_config = CAT_Config(
-
             vocab_size=cfg.dataset.vocab_size,
-            block_size=cfg.model.block_size, 
+            block_size=cfg.model.block_size,
 
-            use_fused_ops=False, # liger-kernels doesn't support vmaps
+            use_fused_ops=False,
             use_qk_norm=cfg.model.use_qk_norm,
 
-            chunk_size=cfg.model.chunk_size, 
-            dim=cfg.model.compressor_dim, 
-            n_head=cfg.model.compressor_n_head, 
-            dim_fx=cfg.model.dim_fx,  
-            
+            chunk_size=cfg.model.chunk_size,
+
+            dim=cfg.model.compressor_dim,
+            n_head=cfg.model.compressor_n_head,
             n_layer=cfg.model.compressor_n_layer,
-        ) # layers are defined according to the paper, but one may use lower number of layers in the compressor
+
+            dim_fx=cfg.model.dim_fx,
+        )
 
         decoder_config = CAT_Config(
-
             vocab_size=cfg.dataset.vocab_size,
-            block_size=cfg.model.block_size, 
+            block_size=cfg.model.block_size,
 
             use_fused_ops=cfg.model.use_fused_ops,
             use_qk_norm=cfg.model.use_qk_norm,
 
-            chunk_size=cfg.model.chunk_size, 
-            dim=cfg.model.dim, 
+            chunk_size=cfg.model.chunk_size,
+
+            dim=cfg.model.dim,
             n_head=cfg.model.n_head,
-            n_layer=cfg.model.n_layer
+            n_layer=cfg.model.n_layer,
         )
 
         model = CAT_Transformer(decoder_config, compressor_config)
@@ -88,9 +117,50 @@ def get_model(accelerate: Accelerator, cfg):
         accelerate.print("CAT decoder config:", decoder_config)
         accelerate.print(model)
         return model
-    
+
+    elif "cat_transformer_hybrid" == cfg.model.name:
+
+        compressor_config = _make_compressor_config(cfg)
+
+        decoder_config = HybridCAT_Config(
+            vocab_size=cfg.dataset.vocab_size,
+            block_size=cfg.model.block_size,
+
+            use_fused_ops=cfg.model.use_fused_ops,
+            use_qk_norm=cfg.model.use_qk_norm,
+
+            chunk_size=cfg.model.chunk_size,
+
+            dim=cfg.model.dim,
+            n_head=cfg.model.n_head,
+            n_layer=cfg.model.n_layer,
+
+            norm_eps=cfg.train.norm_eps,
+
+            mamba2_layers=list(cfg.model.get("mamba2_layers", [])),
+            gdn_layers=list(cfg.model.get("gdn_layers", [])),
+            linear_attn_layers=list(cfg.model.get("linear_attn_layers", [])),
+
+            mamba2_mode=cfg.model.get("mamba2_mode", "parallel"),
+            mamba2_state_size=cfg.model.get("mamba2_state_size", 64),
+            mamba2_n_groups=cfg.model.get("mamba2_n_groups", 1),
+            mamba2_conv_kernel=cfg.model.get("mamba2_conv_kernel", 4),
+            mamba2_use_conv=cfg.model.get("mamba2_use_conv", True),
+
+            gdn_mode=cfg.model.get("gdn_mode", "parallel"),
+            gdn_use_short_conv=cfg.model.get("gdn_use_short_conv", True),
+            gdn_conv_size=cfg.model.get("gdn_conv_size", 4),
+        )
+
+        model = CAT_Transformer_Hybrid(decoder_config, compressor_config)
+
+        accelerate.print("Hybrid CAT compressor config:", compressor_config)
+        accelerate.print("Hybrid CAT decoder config:", decoder_config)
+        accelerate.print(model)
+        return model
+
     else:
-        raise ValueError(f"Unknown model type: {cfg['name']}")
+        raise ValueError(f"Unknown model type: {cfg.model.name}")
 
 
 # https://github.com/Lightning-AI/litgpt/blob/main/litgpt/pretrain.py#L384

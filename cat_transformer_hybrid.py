@@ -765,7 +765,7 @@ class CAT_Transformer_Hybrid(nn.Module):
     def forward(self, input_ids: torch.LongTensor, labels: Optional[torch.LongTensor] = None) -> Tensor:
         bsz, seqlen = input_ids.shape
 
-        pad_multiple = 512
+        pad_multiple = min(512, self.block_size)
         slice_end = False
         if seqlen % pad_multiple != 0:
             new_seqlen = ((seqlen // pad_multiple) + 1) * pad_multiple

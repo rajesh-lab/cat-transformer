@@ -91,7 +91,7 @@ optimizer:
 # don't change this, it will be set by the script
 result_dir:
 
-# choose from [transformer, cat_transformer]
+# choose from [transformer, cat_transformer, cat_transformer_hybrid]
 model_type: transformer
 
 transformer:
@@ -126,6 +126,44 @@ cat_transformer:
     compressor_dim: 768
     compressor_n_head: 12
     compressor_n_layer: 3
+
+cat_transformer_hybrid:
+    name: cat_transformer_hybrid
+
+    block_size: 2048
+    chunk_size: 16
+
+    use_fused_ops: True
+    use_qk_norm: True
+
+    # decoder
+    n_layer: 12
+    dim: 1536
+    n_head: 12
+
+    dim_fx: 1536
+
+    # compressor
+    compressor_dim: 768
+    compressor_n_head: 12
+    compressor_n_layer: 3
+
+    # hybrid layer assignments (layer indices)
+    mamba2_layers: []
+    gdn_layers: []
+    linear_attn_layers: []
+
+    # mamba2 settings
+    mamba2_mode: parallel
+    mamba2_state_size: 128
+    mamba2_n_groups: 1
+    mamba2_conv_kernel: 4
+    mamba2_use_conv: true
+
+    # gdn settings
+    gdn_mode: parallel
+    gdn_use_short_conv: true
+    gdn_conv_size: 4
 
 
 # Populate the model settings based on selection in model_type
