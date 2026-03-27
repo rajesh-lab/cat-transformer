@@ -14,6 +14,7 @@ CAT-masked linear attention (suffix _cat):
 Gated Delta Rule (suffix _gdn):
   6. naive_recurrent_gdn — token-by-token (ground truth)
   7. chunk_gdn — single-pass chunked
+ 7b. full_sequence_gdn — O(L²d) WY + triangular solve, no chunking
 
 CAT-masked Gated Delta Rule (suffix _gdn_cat):
   8. naive_recurrent_gdn_cat — token-by-token (ground truth for CAT)
@@ -92,7 +93,7 @@ def chunk_linear_attn(
     # kv per chunk: [B, NC, H, K, V]
     kv = einsum('b n c h k, b n c h v -> b n h k v', k_c, v_c)
     # cumulative sum, shifted right by 1 (state *before* each chunk)
-    h = kv.cumsum(dim=1)
+    h = kv.cumsum(dim=1) # this is the PARALLEL SCAN!!
     h = torch.cat([q.new_zeros(B, 1, H, K, V), h[:, :-1]], dim=1)
 
     # ------ Pass 2: per-chunk output (all chunks are independent) ------
@@ -510,6 +511,79 @@ def chunk_gdn_parallel(
     return rearrange(o_h, 'b n h c v -> b (n c) h v')
 
 
+# --------------------------------------------------------------------------- #
+# 7b. Full-sequence GDN — O(L²d) via WY/triangular solve, no chunking
+# --------------------------------------------------------------------------- #
+
+def full_sequence_gdn(
+    q: Tensor, k: Tensor, v: Tensor,
+    g: Tensor, beta: Tensor,
+    scale: float | None = None,
+) -> Tensor:
+    """Full-sequence GDN — no chunking, O(L²d) compute, O(L²) memory.
+
+    Uses the WY representation over the whole sequence:
+      1. A = tril(-diag(β̃) · KKᵀ, -1)          strictly lower triangular
+      2. T = (I - A)⁻¹ = I + A + A² + ...       Neumann series (Horner)
+      3. U = T · diag(β̂) · V
+      4. O = exp(G) ⊙ (QKᵀ ⊙ causal) · U
+    """
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+
+    B, L, H, K = q.shape
+
+    q_h = q.permute(0, 2, 1, 3) * scale
+    k_h = k.permute(0, 2, 1, 3)
+    v_h = v.permute(0, 2, 1, 3)
+    g_h = g.permute(0, 2, 1)
+    beta_h = beta.permute(0, 2, 1)
+
+    G = g_h.cumsum(dim=-1)
+    exp_G = G.exp()
+
+    bt = beta_h / g_h.exp()
+    bh = beta_h / exp_G
+
+    KK = torch.matmul(k_h, k_h.transpose(-1, -2))
+    A = -(bt.unsqueeze(-1) * KK)
+    mask = torch.tril(torch.ones(L, L, device=q.device, dtype=torch.bool), diagonal=-1)
+    A = A.masked_fill(~mask, 0.0)
+
+    # T = (I - A)⁻¹ = I + A + A² + ... + A^{L-1}  (A strictly lower tri ⇒ nilpotent)
+    # Repeated squaring: S(2n) = (I + A^n) · S(n)  →  O(log L) matmuls instead of O(L)
+    # Re-mask to lower triangular after each matmul to prevent fp noise accumulation.
+    I_L = torch.eye(L, device=q.device, dtype=q.dtype).expand(B, H, L, L)
+    tril_mask = torch.tril(torch.ones(L, L, device=q.device, dtype=torch.bool))
+    strict_mask = torch.tril(torch.ones(L, L, device=q.device, dtype=torch.bool), diagonal=-1)
+
+    power = A                       # A^n, starting at n=1
+    T = I_L.clone()                 # S(n) = sum_{i=0}^{n-1} A^i, starting at S(1) = I
+
+    bits = []
+    t = L
+    while t > 0:
+        bits.append(t & 1)
+        t >>= 1
+    bits = bits[::-1]               # MSB-first binary of L
+
+    for bit in bits[1:]:            # skip leading 1 (already at n=1)
+        T = (T + torch.matmul(power, T)).masked_fill(~tril_mask, 0.0)
+        power = torch.matmul(power, power).masked_fill(~strict_mask, 0.0)
+        if bit:
+            T = (T + power).masked_fill(~tril_mask, 0.0)
+            power = torch.matmul(power, A).masked_fill(~strict_mask, 0.0)
+
+    U = torch.matmul(T * bh.unsqueeze(-2), v_h)
+
+    QK = torch.matmul(q_h, k_h.transpose(-1, -2))
+    causal = torch.tril(torch.ones(L, L, device=q.device, dtype=torch.bool))
+    QK = QK.masked_fill(~causal, 0.0)
+
+    o_h = exp_G.unsqueeze(-1) * torch.matmul(QK, U)
+    return o_h.permute(0, 2, 1, 3)
+
+
 # =========================================================================== #
 # CAT-masked Gated Delta Rule
 #
@@ -812,39 +886,41 @@ if __name__ == '__main__':
     beta = torch.rand(B, T, H, device=device) * 0.5       # write strength ∈ (0, 0.5)
 
     # ---- correctness: linear attention ----
-    print("=" * 70)
-    print(f"Correctness  (B={B}, T={T}, H={H}, K={K}, chunk_size={chunk_size})")
-    print("=" * 70)
+    # print("=" * 70)
+    # print(f"Correctness  (B={B}, T={T}, H={H}, K={K}, chunk_size={chunk_size})")
+    # print("=" * 70)
 
-    o_naive = naive_recurrent(q, k, v)
-    o_chunk = chunk_linear_attn(q, k, v, chunk_size=chunk_size)
-    o_fused = fused_chunk_linear_attn(q, k, v, chunk_size=chunk_size)
-    print("Standard linear attention:")
-    print(f"  chunk  vs naive: max err = {(o_chunk - o_naive).abs().max().item():.2e}")
-    print(f"  fused  vs naive: max err = {(o_fused - o_naive).abs().max().item():.2e}")
+    # o_naive = naive_recurrent(q, k, v)
+    # o_chunk = chunk_linear_attn(q, k, v, chunk_size=chunk_size)
+    # o_fused = fused_chunk_linear_attn(q, k, v, chunk_size=chunk_size)
+    # print("Standard linear attention:")
+    # print(f"  chunk  vs naive: max err = {(o_chunk - o_naive).abs().max().item():.2e}")
+    # print(f"  fused  vs naive: max err = {(o_fused - o_naive).abs().max().item():.2e}")
 
-    o_ref       = reference_cat_attn(q, k, v, chunk_size=chunk_size)
-    o_naive_cat = naive_recurrent_cat(q, k, v, chunk_size=chunk_size)
-    o_chunk_cat = chunk_linear_attn_cat(q, k, v, chunk_size=chunk_size)
-    print("CAT-masked linear attention:")
-    print(f"  naive  vs ref:   max err = {(o_naive_cat - o_ref).abs().max().item():.2e}")
-    print(f"  chunk  vs ref:   max err = {(o_chunk_cat - o_ref).abs().max().item():.2e}")
+    # o_ref       = reference_cat_attn(q, k, v, chunk_size=chunk_size)
+    # o_naive_cat = naive_recurrent_cat(q, k, v, chunk_size=chunk_size)
+    # o_chunk_cat = chunk_linear_attn_cat(q, k, v, chunk_size=chunk_size)
+    # print("CAT-masked linear attention:")
+    # print(f"  naive  vs ref:   max err = {(o_naive_cat - o_ref).abs().max().item():.2e}")
+    # print(f"  chunk  vs ref:   max err = {(o_chunk_cat - o_ref).abs().max().item():.2e}")
 
     # ---- correctness: gated delta rule (L2-normed q, k) ----
-    print()
-    o_gdn_naive = naive_recurrent_gdn(q_n, k_n, v, g, beta)
-    o_gdn_chunk = chunk_gdn(q_n, k_n, v, g, beta, chunk_size=chunk_size)
-    o_gdn_par   = chunk_gdn_parallel(q_n, k_n, v, g, beta, chunk_size=chunk_size)
-    print("Gated DeltaNet (L2-normed q, k):")
-    print(f"  chunk    vs naive: max err = {(o_gdn_chunk - o_gdn_naive).abs().max().item():.2e}")
-    print(f"  parallel vs naive: max err = {(o_gdn_par - o_gdn_naive).abs().max().item():.2e}")
+    # print()
+    # o_gdn_naive = naive_recurrent_gdn(q_n, k_n, v, g, beta)
+    # o_gdn_chunk = chunk_gdn(q_n, k_n, v, g, beta, chunk_size=chunk_size)
+    # o_gdn_par   = chunk_gdn_parallel(q_n, k_n, v, g, beta, chunk_size=chunk_size)
+    # o_gdn_full  = full_sequence_gdn(q_n, k_n, v, g, beta)
+    # print("Gated DeltaNet (L2-normed q, k):")
+    # print(f"  chunk    vs naive: max err = {(o_gdn_chunk - o_gdn_naive).abs().max().item():.2e}")
+    # print(f"  parallel vs naive: max err = {(o_gdn_par - o_gdn_naive).abs().max().item():.2e}")
+    # print(f"  full_seq vs naive: max err = {(o_gdn_full - o_gdn_naive).abs().max().item():.2e}")
 
-    o_gdn_naive_cat = naive_recurrent_gdn_cat(q_n, k_n, v, g, beta, chunk_size=chunk_size)
-    o_gdn_chunk_cat = chunk_gdn_cat(q_n, k_n, v, g, beta, chunk_size=chunk_size)
-    o_gdn_par_cat = chunk_gdn_cat_parallel(q_n, k_n, v, g, beta, chunk_size=chunk_size)
-    print("CAT-masked Gated DeltaNet:")
-    print(f"  chunk    vs naive: max err = {(o_gdn_chunk_cat - o_gdn_naive_cat).abs().max().item():.2e}")
-    print(f"  parallel vs naive: max err = {(o_gdn_par_cat - o_gdn_naive_cat).abs().max().item():.2e}")
+    # o_gdn_naive_cat = naive_recurrent_gdn_cat(q_n, k_n, v, g, beta, chunk_size=chunk_size)
+    # o_gdn_chunk_cat = chunk_gdn_cat(q_n, k_n, v, g, beta, chunk_size=chunk_size)
+    # o_gdn_par_cat = chunk_gdn_cat_parallel(q_n, k_n, v, g, beta, chunk_size=chunk_size)
+    # print("CAT-masked Gated DeltaNet:")
+    # print(f"  chunk    vs naive: max err = {(o_gdn_chunk_cat - o_gdn_naive_cat).abs().max().item():.2e}")
+    # print(f"  parallel vs naive: max err = {(o_gdn_par_cat - o_gdn_naive_cat).abs().max().item():.2e}")
 
     # ---- throughput ----
     print()
@@ -885,12 +961,13 @@ if __name__ == '__main__':
 
     print("\nGated DeltaNet:")
     gdn_benches = [
-        # ("naive_recurrent_gdn",     naive_recurrent_gdn,     {}),
+        ("naive_recurrent_gdn",     naive_recurrent_gdn,     {}),
         # ("chunk_gdn",               chunk_gdn,               {"chunk_size": chunk_size}),
         ("chunk_gdn_parallel",      chunk_gdn_parallel,      {"chunk_size": chunk_size}),
+        ("full_sequence_gdn",       full_sequence_gdn,       {}),
         # ("naive_recurrent_gdn_cat", naive_recurrent_gdn_cat, {"chunk_size": chunk_size}),
         # ("chunk_gdn_cat",           chunk_gdn_cat,           {"chunk_size": chunk_size}),
-        ("chunk_gdn_cat_parallel",  chunk_gdn_cat_parallel,  {"chunk_size": chunk_size}),
+        # ("chunk_gdn_cat_parallel",  chunk_gdn_cat_parallel,  {"chunk_size": chunk_size}),
     ]
 
     for name, fn, kw in gdn_benches:
@@ -900,92 +977,133 @@ if __name__ == '__main__':
         results[name] = avg
         print(f"  {name:<25s}  {avg:8.2f} ms  (min={mn:.2f}, max={mx:.2f})")
 
+    from mamba2_ssd import naive_mamba2, mamba2_parallel
+
+    N = K  # match state size: Mamba2 (N×D) = GDN/linear (K×V) when N=K, D=V
+    x_m = torch.randn(B, T, H, K, device=device, requires_grad=True)
+    a_m = torch.empty(B, T, H, device=device).uniform_(-1, 0).requires_grad_(True)
+    b_m = (torch.randn(B, T, H, N, device=device) * 0.1).requires_grad_(True)
+    c_m = (torch.randn(B, T, H, N, device=device) * 0.1).requires_grad_(True)
+
+    print("\nMamba2/SSD:")
+    m2_benches = [
+        ("naive_mamba2",        naive_mamba2,    {}),
+        ("mamba2_parallel",     mamba2_parallel, {"chunk_size": chunk_size}),
+    ]
+
+    for name, fn, kw in m2_benches:
+        timings = benchmark_fn(fn, x_m, a_m, b_m, c_m, **kw)
+        avg = sum(timings) / len(timings)
+        mn, mx = min(timings), max(timings)
+        results[name] = avg
+        print(f"  {name:<25s}  {avg:8.2f} ms  (min={mn:.2f}, max={mx:.2f})")
+
+    import torch.nn.functional as F_nn
+
+    def sdpa_causal(q, k, v):
+        # (B, T, H, K) -> (B, H, T, K)
+        return F_nn.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            is_causal=True,
+        ).transpose(1, 2)
+
+    q_sdpa = torch.randn(B, T, H, K, device=device, requires_grad=True)
+    k_sdpa = torch.randn(B, T, H, K, device=device, requires_grad=True)
+    v_sdpa = torch.randn(B, T, H, V, device=device, requires_grad=True)
+
+    print("\nSoftmax attention:")
+    timings = benchmark_fn(sdpa_causal, q_sdpa, k_sdpa, v_sdpa)
+    avg = sum(timings) / len(timings)
+    mn, mx = min(timings), max(timings)
+    results["sdpa (flash)"] = avg
+    print(f"  {'sdpa (flash)':<25s}  {avg:8.2f} ms  (min={mn:.2f}, max={mx:.2f})")
+
     print()
     print("-" * 70)
     baseline = results["chunk_linear_attn"]
     for name, avg in results.items():
         ratio = avg / baseline
-        print(f"  {name:<25s}  {ratio:5.2f}x  vs chunk_linear_attn")
+        print(f"  {name:<30s}  {ratio:5.2f}x  vs chunk_linear_attn")
     print("=" * 70)
 
-    # ================================================================== #
-    # Comparison with fla library (Triton kernels, requires bfloat16)
-    # ================================================================== #
-    print()
-    print("=" * 70)
-    print("Comparison with fla library  (bfloat16)")
-    print("=" * 70)
+    # # ================================================================== #
+    # # Comparison with fla library (Triton kernels, requires bfloat16)
+    # # ================================================================== #
+    # print()
+    # print("=" * 70)
+    # print("Comparison with fla library  (bfloat16)")
+    # print("=" * 70)
 
-    try:
-        from fla.ops.gated_delta_rule import (
-            chunk_gated_delta_rule as fla_chunk_gdn,
-            fused_recurrent_gated_delta_rule as fla_recurrent_gdn,
-        )
-    except ImportError:
-        print("  fla library not available — skipping comparison.")
-        exit()
+    # try:
+    #     from fla.ops.gated_delta_rule import (
+    #         chunk_gated_delta_rule as fla_chunk_gdn,
+    #         fused_recurrent_gated_delta_rule as fla_recurrent_gdn,
+    #     )
+    # except ImportError:
+    #     print("  fla library not available — skipping comparison.")
+    #     exit()
 
-    torch.manual_seed(42)
-    dtype = torch.bfloat16
+    # torch.manual_seed(42)
+    # dtype = torch.bfloat16
 
-    q_bf = _l2_normalize(torch.randn(B, T, H, K, device=device, dtype=dtype))
-    k_bf = _l2_normalize(torch.randn(B, T, H, K, device=device, dtype=dtype))
-    v_bf = torch.randn(B, T, H, V, device=device, dtype=dtype)
-    g_bf = -torch.rand(B, T, H, device=device, dtype=dtype).abs()
-    beta_bf = torch.rand(B, T, H, device=device, dtype=dtype).sigmoid()
+    # q_bf = _l2_normalize(torch.randn(B, T, H, K, device=device, dtype=dtype))
+    # k_bf = _l2_normalize(torch.randn(B, T, H, K, device=device, dtype=dtype))
+    # v_bf = torch.randn(B, T, H, V, device=device, dtype=dtype)
+    # g_bf = -torch.rand(B, T, H, device=device, dtype=dtype).abs()
+    # beta_bf = torch.rand(B, T, H, device=device, dtype=dtype).sigmoid()
 
-    # --- Correctness (ours vs fla) ---
-    print("\nCorrectness (ours in bf16 vs fla in bf16):")
+    # # --- Correctness (ours vs fla) ---
+    # print("\nCorrectness (ours in bf16 vs fla in bf16):")
 
-    o_ours_naive = naive_recurrent_gdn(q_bf, k_bf, v_bf, g_bf, beta_bf)
-    o_ours_chunk = chunk_gdn(q_bf, k_bf, v_bf, g_bf, beta_bf, chunk_size=chunk_size)
-    print(f"  ours: chunk vs naive       max err = {(o_ours_chunk - o_ours_naive).abs().max().item():.2e}")
+    # o_ours_naive = naive_recurrent_gdn(q_bf, k_bf, v_bf, g_bf, beta_bf)
+    # o_ours_chunk = chunk_gdn(q_bf, k_bf, v_bf, g_bf, beta_bf, chunk_size=chunk_size)
+    # print(f"  ours: chunk vs naive       max err = {(o_ours_chunk - o_ours_naive).abs().max().item():.2e}")
 
-    o_fla_chunk, _ = fla_chunk_gdn(q_bf, k_bf, v_bf, g_bf, beta_bf)
-    o_fla_recur, _ = fla_recurrent_gdn(q_bf, k_bf, v_bf, g_bf, beta_bf)
+    # o_fla_chunk, _ = fla_chunk_gdn(q_bf, k_bf, v_bf, g_bf, beta_bf)
+    # o_fla_recur, _ = fla_recurrent_gdn(q_bf, k_bf, v_bf, g_bf, beta_bf)
 
-    print(f"  fla chunk   vs ours naive  max err = {(o_fla_chunk - o_ours_naive).abs().max().item():.2e}")
-    print(f"  fla recur   vs ours naive  max err = {(o_fla_recur - o_ours_naive).abs().max().item():.2e}")
-    print(f"  fla chunk   vs fla recur   max err = {(o_fla_chunk - o_fla_recur).abs().max().item():.2e}")
-    print(f"  fla chunk   vs ours chunk  max err = {(o_fla_chunk - o_ours_chunk).abs().max().item():.2e}")
+    # print(f"  fla chunk   vs ours naive  max err = {(o_fla_chunk - o_ours_naive).abs().max().item():.2e}")
+    # print(f"  fla recur   vs ours naive  max err = {(o_fla_recur - o_ours_naive).abs().max().item():.2e}")
+    # print(f"  fla chunk   vs fla recur   max err = {(o_fla_chunk - o_fla_recur).abs().max().item():.2e}")
+    # print(f"  fla chunk   vs ours chunk  max err = {(o_fla_chunk - o_ours_chunk).abs().max().item():.2e}")
 
-    # --- Throughput (ours vs fla, bfloat16) ---
-    print(f"\nThroughput  (fwd + bwd, bf16)  —  B={B}, T={T}, H={H}, K={K}, chunk={chunk_size}")
+    # # --- Throughput (ours vs fla, bfloat16) ---
+    # print(f"\nThroughput  (fwd + bwd, bf16)  —  B={B}, T={T}, H={H}, K={K}, chunk={chunk_size}")
 
-    q_bf = _l2_normalize(torch.randn(B, T, H, K, device=device, dtype=dtype)).detach().requires_grad_(True)
-    k_bf = _l2_normalize(torch.randn(B, T, H, K, device=device, dtype=dtype)).detach().requires_grad_(True)
-    v_bf = torch.randn(B, T, H, V, device=device, dtype=dtype, requires_grad=True)
-    g_bf = torch.empty(B, T, H, device=device, dtype=dtype).uniform_(-1, 0).requires_grad_(True)
-    beta_bf = torch.empty(B, T, H, device=device, dtype=dtype).uniform_(0.1, 0.9).requires_grad_(True)
+    # q_bf = _l2_normalize(torch.randn(B, T, H, K, device=device, dtype=dtype)).detach().requires_grad_(True)
+    # k_bf = _l2_normalize(torch.randn(B, T, H, K, device=device, dtype=dtype)).detach().requires_grad_(True)
+    # v_bf = torch.randn(B, T, H, V, device=device, dtype=dtype, requires_grad=True)
+    # g_bf = torch.empty(B, T, H, device=device, dtype=dtype).uniform_(-1, 0).requires_grad_(True)
+    # beta_bf = torch.empty(B, T, H, device=device, dtype=dtype).uniform_(0.1, 0.9).requires_grad_(True)
 
-    def fla_chunk_wrapper(q, k, v, g, beta, **kw):
-        o, _ = fla_chunk_gdn(q, k, v, g, beta)
-        return o
+    # def fla_chunk_wrapper(q, k, v, g, beta, **kw):
+    #     o, _ = fla_chunk_gdn(q, k, v, g, beta)
+    #     return o
 
-    def fla_recur_wrapper(q, k, v, g, beta, **kw):
-        o, _ = fla_recurrent_gdn(q, k, v, g, beta)
-        return o
+    # def fla_recur_wrapper(q, k, v, g, beta, **kw):
+    #     o, _ = fla_recurrent_gdn(q, k, v, g, beta)
+    #     return o
 
-    fla_benches = [
-        ("ours: naive_recurrent_gdn",  naive_recurrent_gdn,    {}),
-        ("ours: chunk_gdn",            chunk_gdn,              {"chunk_size": chunk_size}),
-        ("ours: chunk_gdn_cat_par",    chunk_gdn_cat_parallel, {"chunk_size": chunk_size}),
-        ("fla:  chunk_gdn (Triton)",   fla_chunk_wrapper,      {}),
-        # fused_recurrent_gdn omitted: backward not implemented in fla
-    ]
+    # fla_benches = [
+    #     ("ours: naive_recurrent_gdn",  naive_recurrent_gdn,    {}),
+    #     ("ours: chunk_gdn",            chunk_gdn,              {"chunk_size": chunk_size}),
+    #     ("ours: chunk_gdn_cat_par",    chunk_gdn_cat_parallel, {"chunk_size": chunk_size}),
+    #     ("fla:  chunk_gdn (Triton)",   fla_chunk_wrapper,      {}),
+    #     # fused_recurrent_gdn omitted: backward not implemented in fla
+    # ]
 
-    fla_results = {}
-    for name, fn, kw in fla_benches:
-        timings = benchmark_fn(fn, q_bf, k_bf, v_bf, g_bf, beta_bf, **kw)
-        avg = sum(timings) / len(timings)
-        mn, mx = min(timings), max(timings)
-        fla_results[name] = avg
-        print(f"  {name:<30s}  {avg:8.2f} ms  (min={mn:.2f}, max={mx:.2f})")
+    # fla_results = {}
+    # for name, fn, kw in fla_benches:
+    #     timings = benchmark_fn(fn, q_bf, k_bf, v_bf, g_bf, beta_bf, **kw)
+    #     avg = sum(timings) / len(timings)
+    #     mn, mx = min(timings), max(timings)
+    #     fla_results[name] = avg
+    #     print(f"  {name:<30s}  {avg:8.2f} ms  (min={mn:.2f}, max={mx:.2f})")
 
-    print()
-    print("-" * 70)
-    fla_baseline = fla_results["fla:  chunk_gdn (Triton)"]
-    for name, avg in fla_results.items():
-        ratio = avg / fla_baseline
-        print(f"  {name:<30s}  {ratio:5.2f}x  vs fla chunk (Triton)")
-    print("=" * 70)
+    # print()
+    # print("-" * 70)
+    # fla_baseline = fla_results["fla:  chunk_gdn (Triton)"]
+    # for name, avg in fla_results.items():
+    #     ratio = avg / fla_baseline
+    #     print(f"  {name:<30s}  {ratio:5.2f}x  vs fla chunk (Triton)")
+    # print("=" * 70)
