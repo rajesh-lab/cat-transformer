@@ -60,11 +60,7 @@ class MQARDataset(torch.utils.data.Dataset):
         input_ids = input_ids[slc]
         labels = labels[slc]
 
-        if self.model_name == "cat_transformer":
-            assert torch.all(labels[:, -1] == -100)
-            return input_ids, labels[:, :-1], config
-        else:
-            return input_ids, labels, config
+        return input_ids, labels, config
 
 
 def get_dataset(cfg, process_rank=0, num_processes=1):

@@ -1,4 +1,5 @@
 import os
+import math
 import time
 import datetime
 from tqdm import tqdm
@@ -99,11 +100,20 @@ def main(cfg: DictConfig):
     # get model
     model = get_model(accelerate, cfg)
 
+    is_cat = (cfg.model.name == "cat_transformer")
+    if is_cat:
+        max_power = int(math.log2(cfg.model.chunk_size))
+        min_power = 2  # chunk_size = 4
+        chunk_size_powers = list(range(min_power, max_power + 1))
+        accelerate.print(f"CAT chunk_size_powers: {chunk_size_powers} (sizes: {[2**p for p in chunk_size_powers]})")
+
     accelerate.print("*****************************************************************")
     accelerate.print(f"Using #GPUs:", accelerate.num_processes)
     accelerate.print(f"Using Mixed Precision:", accelerate.mixed_precision)
     accelerate.print("Using Model type:", cfg.model.name)
     accelerate.print("Block size:", cfg.model.block_size)
+    if is_cat:
+        accelerate.print("Chunk size:", cfg.model.chunk_size)
     accelerate.print(f"Total parameters: {num_parameters(model):,}")
     accelerate.print("Batch size on single device:", cfg.train.batch_size)
     accelerate.print("Total effective batch size:", cfg.train.batch_size * accelerate.num_processes)
@@ -154,7 +164,11 @@ def main(cfg: DictConfig):
             param_group["lr"] = lr
 
         with accelerate.autocast():
-            loss = model(input_ids, targets)
+            if is_cat:
+                chunk_size_power = chunk_size_powers[iter_num % len(chunk_size_powers)]
+                loss = model(input_ids, targets, chunk_size_power=chunk_size_power)
+            else:
+                loss = model(input_ids, targets)
 
         accelerate.backward(loss)
 
@@ -182,19 +196,29 @@ def main(cfg: DictConfig):
         bar.set_postfix_str(f"loss: {loss.item():.4f}; lr: {lr:.6f}; {token_throughput:.2f}K tokens/s;")
 
         if (iter_num % cfg.eval.eval_interval == 0) and (iter_num > 0):
+            eval_chunk_power = chunk_size_powers[-1] if is_cat else None
 
             train_accuracy = measure_accuracy(
                 accelerate, model, train_val_dataloader, cfg, wandb,
                 split="train", step=iter_num, max_iters=10,
+                chunk_size_power=eval_chunk_power,
             )
             accelerate.print(f"Training Accuracy: {train_accuracy.item():.4f}")
 
-            val_loss, val_ppl = validate(accelerate, model, test_dataloader, cfg)
+            if is_cat:
+                val_results = validate(
+                    accelerate, model, test_dataloader, cfg,
+                    chunk_size_powers=chunk_size_powers,
+                )
+                val_loss, val_ppl = val_results[chunk_size_powers[-1]]
+            else:
+                val_loss, val_ppl = validate(accelerate, model, test_dataloader, cfg)
             accelerate.print(f"Validation Loss: {val_loss:.4f}")
 
             accuracy = measure_accuracy(
                 accelerate, model, test_dataloader, cfg, wandb,
                 step=iter_num,
+                chunk_size_power=eval_chunk_power,
             )
             accelerate.print(f"Validation Accuracy: {accuracy.item():.4f}")
 
@@ -218,8 +242,19 @@ def main(cfg: DictConfig):
 
     accelerate.print("Evaluating at the end of training...")
 
-    val_loss, val_ppl = validate(accelerate, model, test_dataloader, cfg)
-    accuracy = measure_accuracy(accelerate, model, test_dataloader, cfg, wandb, step=cfg.train.train_iters)
+    eval_chunk_power = chunk_size_powers[-1] if is_cat else None
+    if is_cat:
+        val_results = validate(
+            accelerate, model, test_dataloader, cfg,
+            chunk_size_powers=chunk_size_powers,
+        )
+        val_loss, val_ppl = val_results[chunk_size_powers[-1]]
+    else:
+        val_loss, val_ppl = validate(accelerate, model, test_dataloader, cfg)
+    accuracy = measure_accuracy(
+        accelerate, model, test_dataloader, cfg, wandb,
+        step=cfg.train.train_iters, chunk_size_power=eval_chunk_power,
+    )
     accelerate.print(f"Final val loss: {val_loss:.4f}, ppl: {val_ppl:.4f}, accuracy: {accuracy.item():.4f}")
 
     if accelerate.is_main_process:

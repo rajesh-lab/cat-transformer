@@ -110,7 +110,10 @@ def validate(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.ut
             desc = f"Evaluating (chunk={2**power})"
             val_bar = tqdm(enumerate(val_dataloader), total=len(val_dataloader), desc=desc, disable=(not accelerate.is_main_process))
             for k, batch in val_bar:
-                input_ids, targets = batch
+                if len(batch) == 3:
+                    input_ids, targets, _batch_config = batch
+                else:
+                    input_ids, targets = batch
                 if k >= max_iters:
                     break
                 input_ids, targets = input_ids.to(accelerate.device), targets.to(accelerate.device)
@@ -280,7 +283,7 @@ def calculate_grad_norm(model, norm_type=2.0, scaler=None):
 
 
 @torch.no_grad()
-def measure_accuracy(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.utils.data.DataLoader, cfg, wandb, split="val", step=None, max_iters=-1) -> torch.Tensor:
+def measure_accuracy(accelerate: Accelerator, model: nn.Module, val_dataloader: torch.utils.data.DataLoader, cfg, wandb, split="val", step=None, max_iters=-1, chunk_size_power=None) -> torch.Tensor:
     
     print("Accuracy validation...")
     model.eval()
@@ -304,7 +307,10 @@ def measure_accuracy(accelerate: Accelerator, model: nn.Module, val_dataloader: 
                 targets = targets.squeeze(0)
                 
         with accelerate.autocast():
-            output_logits = model(input_ids)
+            if chunk_size_power is not None:
+                output_logits = model(input_ids, chunk_size_power=chunk_size_power)
+            else:
+                output_logits = model(input_ids)
 
         cur_pred = output_logits.argmax(dim=-1)
         # cur_probs = output_logits.softmax(dim=-1).max(dim=-1).values
