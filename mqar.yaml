@@ -154,12 +154,16 @@ cat_transformer_hybrid:
     gdn_layers: []
     linear_attn_layers: []
 
-    # mamba2 settings
+    # mamba2 settings (matching fla Mamba2 defaults)
     mamba2_mode: parallel
+    mamba2_expand: 2
+    mamba2_head_dim: 64
     mamba2_state_size: 128
     mamba2_n_groups: 1
     mamba2_conv_kernel: 4
     mamba2_use_conv: true
+    mamba2_use_conv_bias: true
+    mamba2_compile: false
 
     # gdn settings (fla GatedDeltaNet)
     gdn_mode: parallel

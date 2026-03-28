@@ -142,10 +142,14 @@ def get_model(accelerate: Accelerator, cfg):
             linear_attn_layers=list(cfg.model.get("linear_attn_layers", [])),
 
             mamba2_mode=cfg.model.get("mamba2_mode", "parallel"),
-            mamba2_state_size=cfg.model.get("mamba2_state_size", 64),
+            mamba2_expand=cfg.model.get("mamba2_expand", 2),
+            mamba2_head_dim=cfg.model.get("mamba2_head_dim", 64),
+            mamba2_state_size=cfg.model.get("mamba2_state_size", 128),
             mamba2_n_groups=cfg.model.get("mamba2_n_groups", 1),
             mamba2_conv_kernel=cfg.model.get("mamba2_conv_kernel", 4),
             mamba2_use_conv=cfg.model.get("mamba2_use_conv", True),
+            mamba2_use_conv_bias=cfg.model.get("mamba2_use_conv_bias", True),
+            mamba2_compile=cfg.model.get("mamba2_compile", False),
 
             gdn_mode=cfg.model.get("gdn_mode", "parallel"),
             gdn_use_short_conv=cfg.model.get("gdn_use_short_conv", True),

@@ -473,17 +473,18 @@ class FLAGatedDeltaNetBlock(nn.Module):
 class CATMamba2(nn.Module):
     """Mamba2/SSD with the CAT block-sparse mask.
 
-    Uses pre-discretized SSM inputs and the chunked parallel SSD algorithm
-    from mamba2_ssd.py.  Two modes:
-      'naive'    — token-by-token  (naive_mamba2_cat)
-      'parallel' — chunked parallel (mamba2_parallel_cat)
-
-    Following the fla Mamba2 layer reference:
+    Matches the fla Mamba2 layer architecture:
+    - expand factor (default 2×) for intermediate_size
+    - Own head_dim (default 64) and derived num_heads
     - Single in_proj producing (gate, x_BC, dt)
     - Depthwise causal convolution on (x, B, C) with SiLU activation
-    - A / dt discretization
+    - A / dt discretization, entire SSD computation in float32
     - D skip connection
-    - Per-head RMSNorm + SiLU-gated output
+    - SiLU-gated output then RMSNorm (norm_before_gate=False)
+
+    Two modes:
+      'naive'    — token-by-token  (naive_mamba2_cat)
+      'parallel' — chunked parallel (mamba2_parallel_cat)
     """
 
     def __init__(
@@ -492,10 +493,13 @@ class CATMamba2(nn.Module):
         layer_idx: int,
         cat_block_size: int,
         mode: str = 'parallel',
-        state_size: int = 64,
+        expand: int = 2,
+        head_dim: int = 64,
+        state_size: int = 128,
         n_groups: int = 1,
         conv_kernel: int = 4,
         use_conv: bool = True,
+        use_conv_bias: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -504,42 +508,49 @@ class CATMamba2(nn.Module):
         self.mode = mode
         assert mode in ('naive', 'parallel')
 
-        self.n_head = config.n_head
-        self.head_dim = config.head_dim
         self.dim = config.dim
+        self.expand = expand
+        self.intermediate_size = int(expand * config.dim)
+        self.head_dim = head_dim
+        self.n_head = self.intermediate_size // head_dim
         self.state_size = state_size
         self.n_groups = n_groups
-        self.intermediate_size = config.n_head * config.head_dim
         self.use_conv = use_conv
 
         self.conv_dim = self.intermediate_size + 2 * n_groups * state_size
-        projection_size = self.intermediate_size + self.conv_dim + config.n_head
+        projection_size = self.intermediate_size + self.conv_dim + self.n_head
         self.in_proj = nn.Linear(config.dim, projection_size, bias=False)
 
         if use_conv:
             self.conv1d = nn.Conv1d(
                 self.conv_dim, self.conv_dim, conv_kernel,
-                padding=conv_kernel - 1, groups=self.conv_dim, bias=False,
+                padding=conv_kernel - 1, groups=self.conv_dim, bias=use_conv_bias,
             )
 
-        A = torch.empty(config.n_head, dtype=torch.float32).uniform_(0, 16)
+        A = torch.empty(self.n_head, dtype=torch.float32).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
 
         dt_min, dt_max = 0.001, 0.1
         dt = torch.exp(
-            torch.rand(config.n_head) * (math.log(dt_max) - math.log(dt_min))
+            torch.rand(self.n_head) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min),
         )
         dt = torch.clamp(dt, min=1e-4)
         self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
         self.dt_bias._no_weight_decay = True
 
-        self.D = nn.Parameter(torch.ones(config.n_head))
+        self.D = nn.Parameter(torch.ones(self.n_head))
         self.D._no_weight_decay = True
 
-        self.o_norm = RMSNorm(config.head_dim, eps=config.norm_eps)
+        self._ssd_fn = mamba2_parallel_cat
+
+        self.o_norm = RMSNorm(self.intermediate_size, eps=config.norm_eps)
         self.wo = nn.Linear(self.intermediate_size, config.dim, bias=False)
+
+    def compile_ssd(self):
+        """Replace the SSD kernel with a torch.compiled version."""
+        self._ssd_fn = torch.compile(mamba2_parallel_cat, dynamic=True)
 
     def forward(
         self, x: Tensor, cos: Tensor, sin: Tensor,
@@ -552,8 +563,6 @@ class CATMamba2(nn.Module):
             [self.intermediate_size, self.conv_dim, self.n_head], dim=-1,
         )
 
-        # apply conv to local tokens only
-        # dont apply conv across chunks
         if self.use_conv:
             C_bs = self.cat_block_size
             pad_len_conv = (C_bs - seqlen % C_bs) % C_bs
@@ -581,12 +590,18 @@ class CATMamba2(nn.Module):
             C = C.unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
             C = C.reshape(bsz, seqlen, self.n_head, self.state_size)
 
+        # following fla Mamba2: entire SSD computation in float32
         A = -torch.exp(self.A_log.float())
-        dt_val = F.softplus(dt.float() + self.dt_bias).to(x.dtype)
+        dt_val = F.softplus(dt.float() + self.dt_bias)
+        dt_val = torch.clamp(dt_val, min=1e-4)
 
-        a = A.to(x.dtype) * dt_val                       # (B, T, H) log-decay
-        x_disc = x_ssm * dt_val.unsqueeze(-1)             # (B, T, H, D)
-        D_skip = self.D[None, None, :, None] * x_ssm      # (B, T, H, D)
+        x_ssm = x_ssm.float()
+        B = B.float()
+        C = C.float()
+
+        a = A * dt_val                                     # (B, T, H) log-decay, float32
+        x_disc = x_ssm * dt_val.unsqueeze(-1)              # (B, T, H, D) float32
+        D_skip = self.D[None, None, :, None] * x_ssm       # (B, T, H, D) float32
 
         C_bs = self.cat_block_size
         pad_len = (C_bs - seqlen % C_bs) % C_bs
@@ -599,17 +614,18 @@ class CATMamba2(nn.Module):
         if self.mode == 'naive':
             y = naive_mamba2_cat(x_disc, a, B, C, chunk_size=C_bs)
         else:
-            y = mamba2_parallel_cat(x_disc, a, B, C, chunk_size=C_bs)
+            y = self._ssd_fn(x_disc, a, B, C, chunk_size=C_bs)
 
         if pad_len > 0:
             y = y[:, :seqlen, :, :]
 
         y = y + D_skip
+        y = y.to(x.dtype)
 
-        gate = F.silu(gate.view(bsz, seqlen, self.n_head, self.head_dim))
-        y = self.o_norm(y) * gate
-
+        # fla norm order: gate first, then norm (norm_before_gate=False)
         y = y.contiguous().view(bsz, seqlen, self.intermediate_size)
+        y = self.o_norm(y * F.silu(gate))
+
         return self.wo(y)
 
 
@@ -626,17 +642,22 @@ class CATMamba2Block(nn.Module):
         layer_idx: int,
         cat_block_size: int,
         mode: str = 'parallel',
-        state_size: int = 64,
+        expand: int = 2,
+        head_dim: int = 64,
+        state_size: int = 128,
         n_groups: int = 1,
         conv_kernel: int = 4,
         use_conv: bool = True,
+        use_conv_bias: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
         self.attention = CATMamba2(
             config, layer_idx, cat_block_size,
-            mode=mode, state_size=state_size, n_groups=n_groups,
+            mode=mode, expand=expand, head_dim=head_dim,
+            state_size=state_size, n_groups=n_groups,
             conv_kernel=conv_kernel, use_conv=use_conv,
+            use_conv_bias=use_conv_bias,
         )
 
         if config.use_fused_ops:
@@ -673,10 +694,14 @@ class HybridCAT_Config(CAT_Config):
     fla_gdn_num_heads: int = -1   # -1 => auto: int(0.75 * dim / head_dim)
     fla_gdn_expand_v: float = 2.0
     mamba2_mode: str = 'parallel'
-    mamba2_state_size: int = 64
+    mamba2_expand: int = 2
+    mamba2_head_dim: int = 64
+    mamba2_state_size: int = 128
     mamba2_n_groups: int = 1
     mamba2_conv_kernel: int = 4
     mamba2_use_conv: bool = True
+    mamba2_use_conv_bias: bool = True
+    mamba2_compile: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -729,10 +754,13 @@ class CAT_Transformer_Hybrid(nn.Module):
                 self.layers.append(CATMamba2Block(
                     config, layer_idx=i, cat_block_size=cat_block_size,
                     mode=config.mamba2_mode,
+                    expand=config.mamba2_expand,
+                    head_dim=config.mamba2_head_dim,
                     state_size=config.mamba2_state_size,
                     n_groups=config.mamba2_n_groups,
                     conv_kernel=config.mamba2_conv_kernel,
                     use_conv=config.mamba2_use_conv,
+                    use_conv_bias=config.mamba2_use_conv_bias,
                 ))
             elif i in config.linear_attn_layers:
                 self.layers.append(CATLinearBlock(
@@ -773,6 +801,11 @@ class CAT_Transformer_Hybrid(nn.Module):
                 )
 
         self.get_mask_mod = get_mask_mod
+
+        if config.mamba2_compile:
+            for layer in self.layers:
+                if isinstance(layer, CATMamba2Block):
+                    layer.attention.compile_ssd()
 
     def setup_cache(self, device: torch.device):
         self.f.setup_cache(device=device)

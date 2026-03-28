@@ -93,11 +93,20 @@ def mamba2_parallel(
       Intra-chunk : attention-like causal computation  (all chunks parallel)
       Inter-chunk : state propagation across chunks    (parallel via decay matrix)
       State readout: inter-chunk state → output         (all chunks parallel)
+
+    Following the fla Mamba2 reference, the entire SSD computation runs in
+    float32 to avoid bf16 precision loss in cumsum/exp chains.
     """
     B, T, H, D = x.shape
     N = b.shape[-1]
     CS = chunk_size
     NC = T // CS
+    orig_dtype = x.dtype
+
+    x = x.float()
+    a = a.float()
+    b = b.float()
+    c = c.float()
 
     # Reshape into chunks  (B, NC, CS, H, ...)  →  (B, NC, H, CS, ...)
     x_h = rearrange(x, 'b (nc cs) h d -> b nc h cs d', cs=CS)
@@ -126,26 +135,18 @@ def mamba2_parallel(
     chunk_states = torch.matmul(b_decay.transpose(-1, -2), x_h)     # (B, NC, H, N, D)
 
     # --- Parallel inter-chunk state propagation (decay-matrix matmul) ---
-    # Total log-decay across each chunk: (B, NC, H)
     log_chunk_decay = A_cumsum[..., -1]
 
-    # Pad a zero at the front so index 0 = "before any chunk"
-    # Then segment_sum builds the (NC+1) x (NC+1) pairwise decay matrix
     padded = F.pad(log_chunk_decay, (0, 0, 1, 0))                   # (B, NC+1, H)
-    # segment_sum expects (..., L) — transpose H to batch dims
     padded_t = padded.permute(0, 2, 1)                               # (B, H, NC+1)
     decay_matrix = segment_sum(padded_t).exp()                       # (B, H, NC+1, NC+1)
 
-    # Prepend a zero-state row so shapes align: (B, NC+1, H, N, D)
     chunk_states_pad = torch.cat(
         [x.new_zeros(B, 1, H, N, D), chunk_states], dim=1,
     )
-    # Transpose to (B, H, NC+1, N, D) for matmul with decay_matrix (B, H, NC+1, NC+1)
     cs_t = chunk_states_pad.permute(0, 2, 1, 3, 4)                  # (B, H, NC+1, N, D)
-    # inter_states_all[i] = sum_j decay[i,j] * chunk_states[j]
-    all_states = torch.einsum('bhij,bhjnd->bhind', decay_matrix, cs_t)  # (B, H, NC+1, N, D)
-    # Take first NC entries (states at the *start* of each chunk)
-    inter_states = all_states[:, :, :NC].permute(0, 2, 1, 3, 4)     # (B, NC, H, N, D)
+    all_states = torch.einsum('bhij,bhjnd->bhind', decay_matrix, cs_t)
+    inter_states = all_states[:, :, :NC].permute(0, 2, 1, 3, 4)
 
     # --- State-to-output (off-diagonal blocks) ---
     decay_from_start = A_cumsum.exp()                                # (B, NC, H, CS)
@@ -153,7 +154,7 @@ def mamba2_parallel(
     Y_off = Y_off * decay_from_start.unsqueeze(-1)
 
     y = Y_diag + Y_off
-    return rearrange(y, 'b nc h cs d -> b (nc cs) h d')
+    return rearrange(y, 'b nc h cs d -> b (nc cs) h d').to(orig_dtype)
 
 
 # --------------------------------------------------------------------------- #
@@ -212,17 +213,27 @@ def mamba2_parallel_cat(
     Pass 1: Compute inter-chunk states from first tokens only (parallel via
             decay-matrix matmul — same segment_sum trick as standard SSD).
     Pass 2: Standard SSD intra-chunk + readout from CAT inter-states (parallel).
+
+    The entire SSD computation runs in float32 to avoid bf16 precision loss
+    in cumsum/exp chains. Uses native view/permute (no einops) so that
+    torch.compile can trace a clean graph without graph breaks.
     """
     B, T, H, D = x.shape
     N = b.shape[-1]
     CS = chunk_size
     NC = T // CS
+    orig_dtype = x.dtype
 
-    # Reshape into chunks
-    x_c = rearrange(x, 'b (nc cs) h d -> b nc cs h d', cs=CS)
-    a_c = rearrange(a, 'b (nc cs) h   -> b nc cs h',   cs=CS)
-    b_c = rearrange(b, 'b (nc cs) h n -> b nc cs h n', cs=CS)
-    c_c = rearrange(c, 'b (nc cs) h n -> b nc cs h n', cs=CS)
+    x = x.float()
+    a = a.float()
+    b = b.float()
+    c = c.float()
+
+    # Reshape into chunks — native view instead of einops
+    x_c = x.view(B, NC, CS, H, D)
+    a_c = a.view(B, NC, CS, H)
+    b_c = b.view(B, NC, CS, H, N)
+    c_c = c.view(B, NC, CS, H, N)
 
     # --- Pass 1: inter-chunk states from first tokens only (parallel) ---
     log_a0 = a_c[:, :, 0]                                           # (B, NC, H)
@@ -242,10 +253,10 @@ def mamba2_parallel_cat(
     inter_states = all_states[:, :, :NC].permute(0, 2, 1, 3, 4)     # (B, NC, H, N, D)
 
     # --- Pass 2: SSD parallel within each chunk ---
-    x_h = rearrange(x_c, 'b nc cs h d -> b nc h cs d')
-    a_h = rearrange(a_c, 'b nc cs h   -> b nc h cs')
-    b_h = rearrange(b_c, 'b nc cs h n -> b nc h cs n')
-    c_h = rearrange(c_c, 'b nc cs h n -> b nc h cs n')
+    x_h = x_c.permute(0, 1, 3, 2, 4)                                # (B, NC, H, CS, D)
+    a_h = a_c.permute(0, 1, 3, 2)                                   # (B, NC, H, CS)
+    b_h = b_c.permute(0, 1, 3, 2, 4)                                # (B, NC, H, CS, N)
+    c_h = c_c.permute(0, 1, 3, 2, 4)                                # (B, NC, H, CS, N)
 
     A_cumsum = a_h.cumsum(dim=-1)
 
@@ -261,8 +272,9 @@ def mamba2_parallel_cat(
     Y_off = torch.matmul(c_h, inter_states)
     Y_off = Y_off * decay_from_start.unsqueeze(-1)
 
-    y = Y_diag + Y_off
-    return rearrange(y, 'b nc h cs d -> b (nc cs) h d')
+    y = Y_diag + Y_off                                              # (B, NC, H, CS, D)
+    y = y.permute(0, 1, 3, 2, 4).contiguous().view(B, T, H, D)
+    return y.to(orig_dtype)
 
 
 # --------------------------------------------------------------------------- #
