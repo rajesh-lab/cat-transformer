@@ -109,7 +109,7 @@ def main(cfg: DictConfig):
     # get model
     model = get_model(accelerate, cfg)
 
-    is_cat = (cfg.model.name == "cat_transformer")
+    is_cat = cfg.model.name in ("cat_transformer", "cat_transformer_hybrid")
     if is_cat:
         max_power = int(math.log2(cfg.model.chunk_size))
         min_power = 2  # chunk_size = 4

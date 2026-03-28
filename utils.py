@@ -37,7 +37,7 @@ from cat_transformer_hybrid import (
 
 def _make_compressor_config(cfg):
     """Build compressor config shared by cat_transformer and cat_transformer_hybrid."""
-    return CAT_Config_Fixed(
+    return CAT_Config(
         vocab_size=cfg.dataset.vocab_size,
         block_size=cfg.model.block_size,
 

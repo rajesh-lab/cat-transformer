@@ -30,7 +30,12 @@ from transformer import (
     get_mask_mod,
     build_rope_cache,
 )
-from cat_transformer import CAT_Config, Compressor, get_cat_mask
+from cat_transformer import CAT_Config, get_cat_mask
+from cat_transformer_adaptive import (
+    Compressor,
+    power_of_2, power_of_2_exponent,
+    CAT_Config as AdaptiveCAT_Config,
+)
 from gated_deltanet import naive_recurrent_gdn_cat, chunk_gdn_cat, chunk_gdn_cat_parallel
 from mamba2_ssd import naive_mamba2_cat, mamba2_parallel_cat
 from fla.layers.gated_deltanet import GatedDeltaNet as FLA_GatedDeltaNet
@@ -691,14 +696,22 @@ class CAT_Transformer_Hybrid(nn.Module):
         super().__init__()
         self.config = config
 
+        self._power_of_2_exponent = power_of_2_exponent(config.chunk_size)
+
         self.num_chunks = config.num_chunks
         self.chunk_size = config.chunk_size
         self.block_size = config.block_size
 
         self.f = Compressor(f_config)
 
-        self.dummy_fx = nn.Embedding(1, config.dim)
+        self.dummy_fx = nn.Embedding(self._power_of_2_exponent + 1, config.dim)
         self.wte = nn.Embedding(config.padded_vocab_size, config.dim)
+        self.separator = nn.Embedding(1, config.dim)
+
+        self.cos = dict()
+        self.sin = dict()
+        self.cos_gen = None
+        self.sin_gen = None
 
         cat_block_size = 1 + config.chunk_size
         self.layers = nn.ModuleList()
@@ -763,34 +776,51 @@ class CAT_Transformer_Hybrid(nn.Module):
 
     def setup_cache(self, device: torch.device):
         self.f.setup_cache(device=device)
+        print("power_of_2_exponent:", self._power_of_2_exponent)
 
-        cos, sin = build_rope_cache(
-            1 + self.chunk_size, self.config.rope_n_elem,
-            device=device, base=self.config.rope_base,
-        )
-        cos = einops.repeat(cos, '1 l d -> 1 k l d', k=self.num_chunks + 1).clone()
-        sin = einops.repeat(sin, '1 l d -> 1 k l d', k=self.num_chunks + 1).clone()
-        cos = einops.rearrange(cos, '1 k l d -> 1 (k l) d')
-        sin = einops.rearrange(sin, '1 k l d -> 1 (k l) d')
-        cos = cos[:, :self.block_size + self.num_chunks + 1, :].contiguous()
-        sin = sin[:, :self.block_size + self.num_chunks + 1, :].contiguous()
+        for c in range(1 + self._power_of_2_exponent):
+            chunk_size = int(2 ** c)
+            print("creating cos and sin cache for chunk size:", chunk_size)
 
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+            assert self.block_size % chunk_size == 0
+            num_chunks = self.block_size // chunk_size
 
-        _cos, _sin = build_rope_cache(
-            self.block_size, self.config.rope_n_elem,
-            device=device, base=self.config.rope_base,
-        )
-        self.register_buffer("cos_gen", _cos, persistent=False)
-        self.register_buffer("sin_gen", _sin, persistent=False)
+            _cos, _sin = build_rope_cache(
+                num_chunks + chunk_size + 2,
+                self.config.rope_n_elem,
+                device=device,
+                base=self.config.rope_base,
+            )
+            if c == self._power_of_2_exponent:
+                self.cos_gen = _cos.clone()
+                self.sin_gen = _sin.clone()
+
+            cos, sin = build_rope_cache(
+                2 + chunk_size,
+                self.config.rope_n_elem,
+                device=device,
+                base=self.config.rope_base,
+            )
+            cos = einops.repeat(cos, '1 l d -> 1 k l d', k=num_chunks + 1).clone()
+            sin = einops.repeat(sin, '1 l d -> 1 k l d', k=num_chunks + 1).clone()
+
+            cos = einops.rearrange(cos, '1 k l d -> 1 (k l) d').clone()
+            sin = einops.rearrange(sin, '1 k l d -> 1 (k l) d').clone()
+
+            cos = cos[:, :self.block_size + 2 * num_chunks + 2, :].clone()
+            sin = sin[:, :self.block_size + 2 * num_chunks + 2, :].clone()
+
+            self.cos[c] = cos.clone()
+            self.sin[c] = sin.clone()
+
+            print("created cos and sin cache for chunk size:", chunk_size)
+            print("cos shape:", self.cos[c].shape)
 
         n_std = sum(1 for l in self.layers if isinstance(l, TransformerBlock))
         n_lin = sum(1 for l in self.layers if isinstance(l, CATLinearBlock))
         n_gdn = sum(1 for l in self.layers if isinstance(l, FLAGatedDeltaNetBlock))
         n_m2 = sum(1 for l in self.layers if isinstance(l, CATMamba2Block))
         print(f"Hybrid CAT: {n_std} standard + {n_lin} linear + {n_gdn} GDN (fla) + {n_m2} Mamba2 layers")
-        print("cos shape:", self.cos.shape)
 
     # ---- generation helpers ----
 
@@ -829,10 +859,13 @@ class CAT_Transformer_Hybrid(nn.Module):
 
     # ---- training forward ----
 
-    def forward(self, input_ids: torch.LongTensor, labels: Optional[torch.LongTensor] = None) -> Tensor:
+    def forward(self, input_ids: torch.LongTensor, labels: Optional[torch.LongTensor] = None, chunk_size_power: Optional[int] = None) -> Tensor:
         bsz, seqlen = input_ids.shape
 
-        pad_multiple = min(512, self.block_size)
+        assert chunk_size_power is not None
+        cur_iter_chunk_size = power_of_2(chunk_size_power)
+
+        pad_multiple = 512
         slice_end = False
         if seqlen % pad_multiple != 0:
             new_seqlen = ((seqlen // pad_multiple) + 1) * pad_multiple
@@ -842,39 +875,51 @@ class CAT_Transformer_Hybrid(nn.Module):
             seqlen = new_seqlen
             slice_end = True
 
-        cur_num_chunks = seqlen // self.chunk_size
-        input_ids = input_ids.view(bsz, cur_num_chunks, self.chunk_size)
+        cur_num_chunks = seqlen // cur_iter_chunk_size
+        input_ids = input_ids.view(bsz, cur_num_chunks, cur_iter_chunk_size)
 
-        # compress
-        fx = torch.vmap(self.f.compress, in_dims=(1, 0), out_dims=1)(
+        # compress all chunks in parallel (adaptive 3-arg signature)
+        fx = torch.vmap(self.f.compress, in_dims=(1, 0, None), out_dims=1)(
             input_ids,
             torch.arange(cur_num_chunks, device=input_ids.device),
+            torch.tensor(chunk_size_power, device=input_ids.device, dtype=torch.long),
         )
         fx = self.down_proj(fx)
         fx_last = fx[:, -1, :].unsqueeze(1)
 
-        dummy_fx = self.dummy_fx(torch.zeros(1, device=input_ids.device, dtype=torch.long))
+        dummy_fx = self.dummy_fx(torch.tensor([chunk_size_power], device=input_ids.device, dtype=torch.long))
         dummy_fx = einops.repeat(dummy_fx, '1 d -> b 1 d', b=bsz)
 
         fx = torch.cat([dummy_fx, fx[:, :-1, :]], dim=1)
         fx = einops.rearrange(fx, 'b k d -> b k 1 d')
 
-        emb_x = self.wte(input_ids)
-        x = torch.cat([fx, emb_x], dim=2)
-        x = einops.rearrange(x, 'b k l d -> b (k l) d')
-        x = torch.cat([x, fx_last], dim=1)
+        sep_token = self.separator(torch.zeros(1, device=input_ids.device, dtype=torch.long))
+        sep_token = einops.repeat(sep_token, '1 d -> b k 1 d', b=bsz, k=cur_num_chunks)
+        last_sep_token = self.separator(torch.zeros(1, device=input_ids.device, dtype=torch.long))
+        last_sep_token = einops.repeat(last_sep_token, '1 d -> b 1 d', b=bsz)
 
-        cos = self.cos[:, :x.shape[1], :]
-        sin = self.sin[:, :x.shape[1], :]
+        emb_x = self.wte(input_ids)
+        x = torch.cat([fx, sep_token, emb_x], dim=2)
+        x = einops.rearrange(x, 'b k l d -> b (k l) d')
+        x = torch.cat([x, fx_last, last_sep_token], dim=1)
+
+        cos = self.cos[chunk_size_power][:, :x.shape[1], :]
+        sin = self.sin[chunk_size_power][:, :x.shape[1], :]
 
         # flex_attention mask only needed when standard layers exist
         mask = None
         if self.has_standard_attn:
             mask = create_block_mask(
-                get_cat_mask(1 + self.chunk_size),
+                get_cat_mask(1 + 1 + cur_iter_chunk_size),
                 B=None, H=None,
                 Q_LEN=x.shape[1], KV_LEN=x.shape[1],
             )
+
+        # update cat_block_size on hybrid layers to match current chunk size
+        cur_cat_block_size = 2 + cur_iter_chunk_size
+        for layer in self.layers:
+            if hasattr(layer, 'attention') and hasattr(layer.attention, 'cat_block_size'):
+                layer.attention.cat_block_size = cur_cat_block_size
 
         for layer in self.layers:
             x = layer(x, cos=cos, sin=sin, mask=mask)
@@ -883,11 +928,11 @@ class CAT_Transformer_Hybrid(nn.Module):
         # rearrange to (B, L, D) for next-token prediction
         x_last = x[:, -1:, :].contiguous()
         x = einops.rearrange(
-            x[:, :-1, :], 'b (k l) d -> b k l d',
-            k=cur_num_chunks, l=self.chunk_size + 1,
+            x[:, :-2, :], 'b (k l) d -> b k l d',
+            k=cur_num_chunks, l=cur_iter_chunk_size + 2,
         )
-        x_first = x[:, :1, 1:-1, :].contiguous()
-        x_middle = x[:, 1:, :-1, :].contiguous()
+        x_first = x[:, :1, 2:-1, :].contiguous()
+        x_middle = x[:, 1:, 1:-1, :].contiguous()
         x_first = einops.rearrange(x_first, 'b 1 l d -> b (1 l) d')
         x_middle = einops.rearrange(x_middle, 'b k l d -> b (k l) d')
         x = torch.cat([x_first, x_middle, x_last], dim=1)
