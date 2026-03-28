@@ -33,6 +33,7 @@ from transformer import (
 from cat_transformer import CAT_Config, Compressor, get_cat_mask
 from gated_deltanet import naive_recurrent_gdn_cat, chunk_gdn_cat, chunk_gdn_cat_parallel
 from mamba2_ssd import naive_mamba2_cat, mamba2_parallel_cat
+from fla.layers.gated_deltanet import GatedDeltaNet as FLA_GatedDeltaNet
 
 from torch.nn.attention.flex_attention import create_block_mask, BlockMask
 create_block_mask = torch.compile(create_block_mask)
@@ -406,6 +407,61 @@ class CATGatedDeltaNetBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# FLAGatedDeltaNetBlock — uses fla library's GatedDeltaNet
+# --------------------------------------------------------------------------- #
+
+class FLAGatedDeltaNetBlock(nn.Module):
+    """TransformerBlock variant using fla's optimised GatedDeltaNet (causal).
+
+    Unlike CATGatedDeltaNetBlock, the fla GDN layer is purely causal (no CAT
+    block-sparse mask).  Positional information flows through the standard
+    softmax-attention layers in the hybrid stack.
+    """
+
+    def __init__(
+        self,
+        config: 'HybridCAT_Config',
+        layer_idx: int,
+        head_dim: int = 128,
+        num_heads: int = 8,
+        expand_v: float = 2.0,
+        use_short_conv: bool = True,
+        conv_size: int = 4,
+    ) -> None:
+        super().__init__()
+        self.config = config
+
+        self.attention = FLA_GatedDeltaNet(
+            hidden_size=config.dim,
+            head_dim=head_dim,
+            num_heads=num_heads,
+            expand_v=expand_v,
+            use_gate=True,
+            use_short_conv=use_short_conv,
+            conv_size=conv_size,
+            mode='chunk',
+            layer_idx=layer_idx,
+            norm_eps=config.norm_eps,
+        )
+
+        if config.use_fused_ops:
+            self.feed_forward = LigerSwiGLUMLP(config)
+            self.ffn_norm = LigerRMSNorm(config.dim, eps=config.norm_eps)
+            self.attention_norm = LigerRMSNorm(config.dim, eps=config.norm_eps)
+        else:
+            self.feed_forward = LLaMAMLP(config)
+            self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
+            self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
+
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
+                is_causal: bool = True, mask=None, input_pos=None) -> Tensor:
+        o, _, _ = self.attention(self.attention_norm(x))
+        h = x + o
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
+
+# --------------------------------------------------------------------------- #
 # CATMamba2 — Mamba2/SSD-based drop-in replacement for Attention
 # --------------------------------------------------------------------------- #
 
@@ -607,6 +663,10 @@ class HybridCAT_Config(CAT_Config):
     gdn_mode: str = 'parallel'
     gdn_use_short_conv: bool = True
     gdn_conv_size: int = 4
+    # fla GatedDeltaNet params (used when gdn_layers is set)
+    fla_gdn_head_dim: int = 128
+    fla_gdn_num_heads: int = -1   # -1 => auto: int(0.75 * dim / head_dim)
+    fla_gdn_expand_v: float = 2.0
     mamba2_mode: str = 'parallel'
     mamba2_state_size: int = 64
     mamba2_n_groups: int = 1
@@ -644,9 +704,11 @@ class CAT_Transformer_Hybrid(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(config.n_layer):
             if i in config.gdn_layers:
-                self.layers.append(CATGatedDeltaNetBlock(
-                    config, layer_idx=i, cat_block_size=cat_block_size,
-                    mode=config.gdn_mode,
+                self.layers.append(FLAGatedDeltaNetBlock(
+                    config, layer_idx=i,
+                    head_dim=config.fla_gdn_head_dim,
+                    num_heads=config.fla_gdn_num_heads,
+                    expand_v=config.fla_gdn_expand_v,
                     use_short_conv=config.gdn_use_short_conv,
                     conv_size=config.gdn_conv_size,
                 ))
@@ -686,9 +748,14 @@ class CAT_Transformer_Hybrid(nn.Module):
         self.apply(lambda m: _init_weights(m, self.config.n_layer, self.config.dim))
         self.f.apply(lambda m: _init_weights(m, self.f.config.n_layer, self.f.config.dim))
         for layer in self.layers:
-            if isinstance(layer, (CATLinearBlock, CATGatedDeltaNetBlock, CATMamba2Block)):
+            if isinstance(layer, (CATLinearBlock, CATMamba2Block)):
                 nn.init.normal_(
                     layer.attention.wo.weight,
+                    mean=0.0, std=1.0 / math.sqrt(config.dim) / config.n_layer,
+                )
+            elif isinstance(layer, FLAGatedDeltaNetBlock):
+                nn.init.normal_(
+                    layer.attention.o_proj.weight,
                     mean=0.0, std=1.0 / math.sqrt(config.dim) / config.n_layer,
                 )
 
@@ -720,9 +787,9 @@ class CAT_Transformer_Hybrid(nn.Module):
 
         n_std = sum(1 for l in self.layers if isinstance(l, TransformerBlock))
         n_lin = sum(1 for l in self.layers if isinstance(l, CATLinearBlock))
-        n_gdn = sum(1 for l in self.layers if isinstance(l, CATGatedDeltaNetBlock))
+        n_gdn = sum(1 for l in self.layers if isinstance(l, FLAGatedDeltaNetBlock))
         n_m2 = sum(1 for l in self.layers if isinstance(l, CATMamba2Block))
-        print(f"Hybrid CAT: {n_std} standard + {n_lin} linear + {n_gdn} GDN + {n_m2} Mamba2 layers")
+        print(f"Hybrid CAT: {n_std} standard + {n_lin} linear + {n_gdn} GDN (fla) + {n_m2} Mamba2 layers")
         print("cos shape:", self.cos.shape)
 
     # ---- generation helpers ----

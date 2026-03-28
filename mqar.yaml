@@ -161,10 +161,13 @@ cat_transformer_hybrid:
     mamba2_conv_kernel: 4
     mamba2_use_conv: true
 
-    # gdn settings
+    # gdn settings (fla GatedDeltaNet)
     gdn_mode: parallel
     gdn_use_short_conv: true
     gdn_conv_size: 4
+    fla_gdn_head_dim: 128
+    fla_gdn_num_heads: 8
+    fla_gdn_expand_v: 2.0
 
 
 # Populate the model settings based on selection in model_type

@@ -150,6 +150,10 @@ def get_model(accelerate: Accelerator, cfg):
             gdn_mode=cfg.model.get("gdn_mode", "parallel"),
             gdn_use_short_conv=cfg.model.get("gdn_use_short_conv", True),
             gdn_conv_size=cfg.model.get("gdn_conv_size", 4),
+
+            fla_gdn_head_dim=cfg.model.get("fla_gdn_head_dim", 128),
+            fla_gdn_num_heads=cfg.model.get("fla_gdn_num_heads", 8),
+            fla_gdn_expand_v=cfg.model.get("fla_gdn_expand_v", 2.0),
         )
 
         model = CAT_Transformer_Hybrid(decoder_config, compressor_config)
