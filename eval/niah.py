@@ -1,12 +1,24 @@
+"""
+NIAH (Needle-In-A-Haystack) evaluation for Transformer, CAT_Transformer, and CAT_Transformer_Hybrid.
+
+Uses RULER benchmark JSONL datasets.
+
+Usage:
+    python eval/niah.py --model_type cat_transformer_hybrid --chunk_size_power 4
+    python eval/niah.py --model_type vanilla --file_name niah_vanilla
+    python eval/niah.py --model_type cat_transformer_hybrid --model_path /path/to/ckpt --chunk_size_power 4
+"""
+
 import os
 import sys
+import json
 import numpy as np
+from pathlib import Path
 from tqdm import tqdm
 
 import argparse
 
 import torch
-import datasets
 from transformers import AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,8 +39,8 @@ from cat_transformer_hybrid import (
 )
 
 @torch.no_grad()
-def generate_autoregressive(input_ids, model, num_new_tokens=48, do_sample=False, chunk_size_power=None):
-    """Simple autoregressive generation (slow but correct). Works for both Transformer and CAT_Transformer."""
+def generate_autoregressive(input_ids, model, num_new_tokens=32, do_sample=False, chunk_size_power=None):
+    """Simple autoregressive generation (slow but correct)."""
     cur_input_ids = input_ids.clone()
     for _ in range(num_new_tokens):
         if isinstance(model, (CAT_Transformer, CAT_Transformer_Hybrid)):
@@ -48,60 +60,12 @@ def generate_autoregressive(input_ids, model, num_new_tokens=48, do_sample=False
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
-def get_common(dataset_name):
-    assert dataset_name in ["hazyresearch/based-squad", "hazyresearch/based-swde", "hazyresearch/based-fda"]
-    eval_dataset = datasets.load_dataset(dataset_name)
-
-    def tokenize_text(example):
-        return tokenizer(example["text"].strip())
-
-    def tokenize_value(example):
-        return tokenizer(example["value"].strip())
-
-    def tokenize_text_value(example):
-        return tokenizer(example["text"].strip() + " " + example["value"].strip(), padding="max_length", truncation=True, max_length=1024)
-    
-    tokenized_text = eval_dataset["validation"].map(tokenize_text)
-    tokenized_value = eval_dataset["validation"].map(tokenize_value)
-    tokenized_text_value = eval_dataset["validation"].map(tokenize_text_value)
-
-    return tokenized_text, tokenized_value, tokenized_text_value
-
-def get_other(dataset_name):
-    assert dataset_name in ["hazyresearch/based_triviaqa", "hazyresearch/based_drop"]
-
-    eval_dataset = datasets.load_dataset(dataset_name)
-
-    def tokenize_text(example):
-        return tokenizer(example["context"].strip() + " " + example["question"].strip())
-    
-    def tokenize_value(example):
-        return tokenizer(example["answers"][0].strip())
-    
-    def tokenize_text_value(example):
-        return tokenizer(example["context"].strip() + " " + example["question"].strip() + " " + example["answers"][0].strip(), padding="max_length", truncation=True, max_length=1024)
-    
-    tokenized_text = eval_dataset["validation"].map(tokenize_text)
-    tokenized_value = eval_dataset["validation"].map(tokenize_value)
-    tokenized_text_value = eval_dataset["validation"].map(tokenize_text_value)
-
-    return tokenized_text, tokenized_value, tokenized_text_value
-
-
-def get_tokenized_dataset(dataset_name):
-    if dataset_name in ["hazyresearch/based-squad", "hazyresearch/based-swde", "hazyresearch/based-fda"]:
-        return get_common(dataset_name)
-    elif dataset_name in ["hazyresearch/based_triviaqa", "hazyresearch/based_drop"]:
-        return get_other(dataset_name)
-    else:
-        raise ValueError
-
-
 block_size = 1024
+
 def get_model(model_type):
     if model_type == "vanilla":
         config = TransformerConfig(
-            vocab_size=50257, # gpt2
+            vocab_size=50257,
             block_size=block_size,
             dim=1024,
             n_head=16,
@@ -115,29 +79,23 @@ def get_model(model_type):
         chunk_size = 16
 
         compressor_config = CAT_Config(
-            vocab_size=50257, # gpt2
+            vocab_size=50257,
             block_size=block_size,
             chunk_size=chunk_size,
-
             dim=1024,
             n_head=16,
             n_layer=3,
-
             dim_fx=2048,
-
             use_qk_norm=True,
-            # we don't use fused ops here due to no support of vmap in liger-kernels :((
         )
 
         decoder_config = CAT_Config(
-            vocab_size=50257, # gpt2
+            vocab_size=50257,
             block_size=block_size,
             chunk_size=chunk_size,
-
             dim=2048,
             n_head=32,
             n_layer=12,
-
             use_qk_norm=True,
             use_fused_ops=True,
         )
@@ -167,7 +125,7 @@ def get_model(model_type):
             n_layer=12,
             use_qk_norm=True,
             use_fused_ops=True,
-            gdn_layers=[1,3,5,7,9,11],
+            gdn_layers=[1, 3, 5, 7, 9, 11],
             fla_gdn_num_heads=8,
             fla_gdn_head_dim=128,
             fla_gdn_expand_v=2.0,
@@ -179,6 +137,7 @@ def get_model(model_type):
         raise ValueError(f"Unknown model type: {model_type}")
 
     return model
+
 
 if __name__ == "__main__":
 
@@ -192,13 +151,20 @@ if __name__ == "__main__":
         "cat_transformer_hybrid" : "/gpfs/data/ranganathlab/Jatin/cat-transformer/Results/fineweb-5b/2026-03-28/01:25:03.783948/intermediate_state_dict_0033750.pt",
     }
 
-    # python eval/recall.py --model_type cat_transformer_hybrid --chunk_size_power 4
-    # setup arg parser
-    parser = argparse.ArgumentParser(description="Evaluate generation on retrieval tasks")
+    # python eval/niah.py --model_type cat_transformer_hybrid --chunk_size_power 2
+    # python eval/niah.py --model_type cat_transformer_hybrid --chunk_size_power 4 --datasets "niah-numbers-1k" --file_name hybrid_niah
+
+    parser = argparse.ArgumentParser(description="NIAH evaluation using RULER benchmark")
     parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked, cat_transformer_hybrid")
     parser.add_argument("--model_path", type=str, default=None, help="Override model checkpoint path")
     parser.add_argument("--file_name", type=str, default="test", help="File name to save results")
     parser.add_argument("--chunk_size_power", type=int, default=4, help="Chunk size power (default: 4)")
+    parser.add_argument("--dataset_prefix", type=str,
+                        default="/gpfs/data/ranganathlab/Jatin/RULER/scripts/data/synthetic/{}/validation.jsonl",
+                        help="Dataset path template with {} for dataset name")
+    parser.add_argument("--datasets", type=str, default="niah-numbers-1k,niah-numbers-2k,niah-numbers-4k",
+                        help="Comma-separated NIAH dataset names")
+    parser.add_argument("--num_new_tokens", type=int, default=32, help="Number of tokens to generate (default: 32)")
 
     args = parser.parse_args()
     model_type = args.model_type
@@ -215,66 +181,69 @@ if __name__ == "__main__":
     print(model.load_state_dict(new_state_dict, strict=True))
 
     model.eval()
-
     model.to(device=device)
     model.setup_cache(device=device)
 
-    for dataset_name in [
-        # "hazyresearch/based-fda",
-        "hazyresearch/based-swde",
-    ]:
+    dataset_names = [d.strip() for d in args.datasets.split(",")]
+
+    for dataset_name in dataset_names:
+
+        print("Evaluating on dataset: ", dataset_name)
 
         acc = list()
 
-        tokenized_text, tokenized_value, tokenized_text_value = get_tokenized_dataset(dataset_name)
-        tokenized_text = tokenized_text["input_ids"]
-        tokenized_value = tokenized_value["input_ids"]
-        tokenized_text_value = tokenized_text_value["input_ids"]
-        N = len(tokenized_text_value)
+        tokenized_text = list()
+        in_path = Path(args.dataset_prefix.format(dataset_name))
+        assert in_path.exists(), f"Dataset not found: {in_path}"
+        with in_path.open("r", encoding="utf-8") as f:
+            for line in tqdm(f, desc="Tokenizing"):
+                obj = json.loads(line)
+                ids = tokenizer.encode(obj["input"] + obj["answer_prefix"], add_special_tokens=False)
+                obj["input_ids"] = ids
+                tokenized_text.append(obj)
+        N = len(tokenized_text)
 
         print("Evaluating on dataset: ", dataset_name)
         print("Model type: ", model_type)
         print("Model path: ", model_path)
         print("Max val tokens: ", MAX_VAL_TOKENS)
-        print("Num samples: ", len(tokenized_text_value))
+        print("Num samples: ", N)
         print()
 
         bar = tqdm(range(N))
         for i in bar:
-            num_value_tokens = len(tokenized_value[i])
 
-            if (num_value_tokens > MAX_VAL_TOKENS) or (len(tokenized_text[i]) + len(tokenized_value[i]) >= block_size - 50):
-                continue
-
-            input_ids = torch.tensor(tokenized_text[i], dtype=torch.long, device=device) # (l, )
-            input_ids = input_ids.unsqueeze(0) # (1, l)
+            input_ids = torch.tensor(tokenized_text[i]["input_ids"], dtype=torch.long, device=device)
+            input_ids = input_ids.unsqueeze(0)
             start_idx = input_ids.shape[1]
 
             with torch.autocast(device_type=device, dtype=dtype):
                 output_ids = generate_autoregressive(
                     input_ids, model,
-                    num_new_tokens=48,
+                    num_new_tokens=args.num_new_tokens,
                     do_sample=False,
                     chunk_size_power=args.chunk_size_power,
                 )
 
-            output_ids = output_ids[0, start_idx:] # (num_new_tokens, )
+            output_ids = output_ids[0, start_idx:]
             answer_span = tokenizer.decode(output_ids.cpu().numpy()).strip()
 
-            if tokenizer.decode(tokenized_value[i]).strip() in answer_span:
-                cur_acc = 1
-            else:
-                cur_acc = 0
+            cur_acc = 0
+            for x in tokenized_text[i]["outputs"]:
+                if x in answer_span:
+                    cur_acc = 1
+                    break
+
             acc.append(cur_acc)
-            bar.set_postfix_str(f"acc: {np.array(acc).mean():.4f}, accepted samples: {len(acc)}")
+            bar.set_postfix_str(f"acc: {np.array(acc).mean():.4f}, accepted samples: {len(acc)}, seq length: {input_ids.shape[1]}")
 
         acc = np.array(acc)
         import pandas as pd
 
         results = {
             "model_type": model_type,
-            "chunk_size_power": args.chunk_size_power,
             "dataset_name": dataset_name,
+            "chunk_size_power": args.chunk_size_power,
             "acc": acc.mean(),
             "num_samples": len(acc),
             "num_correct": np.sum(acc),
@@ -291,10 +260,9 @@ if __name__ == "__main__":
 
         print("Dumping results to csv...")
 
-        folder_path = "benchmark_logs_v2/evaporate_rope_ablation"
+        folder_path = "benchmark_logs_v2/niah_v2"
         os.makedirs(folder_path, exist_ok=True)
 
-        # convert to dataframe
         df = pd.DataFrame(results, index=[0])
         file_path = f"{folder_path}/{file_name}.csv"
         write_header = not os.path.exists(file_path)

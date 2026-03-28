@@ -8,6 +8,10 @@ Usage:
     --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_1,niah_single_3 --metadata '{"max_seq_lengths":[2048,4096]}' \
     --limit 10 --output_path eval/test.json
 
+    python eval/harness.py --model_type cat_transformer_hybrid --chunk_size_power 2 \
+    --tasks niah_single_2,swde --metadata '{"max_seq_lengths":[1024]}' \
+    --limit 10 --output_path eval/test.json
+
     python eval/harness.py --model_type chunked --chunk_size_power 3 --tasks niah_single_1 --metadata '{"max_seq_lengths":[1024]}' --output_path eval/test.json
 
     # wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_1
@@ -33,13 +37,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transformer import TransformerConfig, Transformer
 from cat_transformer_adaptive import CAT_Config, CAT_Transformer
+from cat_transformer_hybrid import HybridCAT_Config, CAT_Transformer_Hybrid
 
 import lm_eval
 from lm_eval.api.model import LM
 from lm_eval.models.huggingface import HFLM
 
 # BLOCK_SIZE = 2048
-BLOCK_SIZE = 4096
+BLOCK_SIZE = 1024
 
 MODEL_TYPE_TO_PATH = {
     
@@ -53,6 +58,7 @@ MODEL_TYPE_TO_PATH = {
     # gpt2 -- 15B tokens, 4K context, D=1024
     "vanilla" : "/scratch/jp7467/cat-transformer/Results/fineweb-15b/2026-03-16/13:24:52.608318/state_dict.pt", # 12L
     "vanilla2" : "/scratch/jp7467/cat-transformer/Results/fineweb-15b/2026-03-16/13:34:38.920977/state_dict.pt", # 24L
+    "cat_transformer_hybrid" : "/gpfs/data/ranganathlab/Jatin/cat-transformer/Results/fineweb-5b/2026-03-28/01:25:03.783948/intermediate_state_dict_0033750.pt",
 }
 
 TOKENIZER_NAME = "gpt2"
@@ -110,13 +116,42 @@ def get_model(model_type):
         )
         return CAT_Transformer(decoder_config, compressor_config)
 
+    elif model_type == "cat_transformer_hybrid":
+        chunk_size = 16
+        compressor_config = CAT_Config(
+            vocab_size=VOCAB_SIZE,
+            block_size=BLOCK_SIZE,
+            chunk_size=chunk_size,
+            dim=1024,
+            n_head=16,
+            n_layer=3,
+            dim_fx=1536,
+            use_qk_norm=True,
+        )
+        decoder_config = HybridCAT_Config(
+            vocab_size=VOCAB_SIZE,
+            block_size=BLOCK_SIZE,
+            chunk_size=chunk_size,
+            dim=1536,
+            n_head=24,
+            n_layer=12,
+            use_qk_norm=True,
+            use_fused_ops=True,
+            gdn_layers=[1, 3, 5, 7, 9, 11],
+            fla_gdn_num_heads=8,
+            fla_gdn_head_dim=128,
+            fla_gdn_expand_v=2.0,
+        )
+        return CAT_Transformer_Hybrid(decoder_config, compressor_config)
+
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
 
-def load_model(model_type, device="cuda"):
+def load_model(model_type, device="cuda", model_path=None):
     model = get_model(model_type)
-    model_path = MODEL_TYPE_TO_PATH[model_type]
+    if model_path is None:
+        model_path = MODEL_TYPE_TO_PATH[model_type]
 
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
     new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
@@ -138,6 +173,7 @@ class CATTransformerLM(HFLM):
         device: str = "cuda",
         batch_size: int = 1,
         max_length: int = BLOCK_SIZE,
+        model_path: str = None,
     ):
         # bypass HFLM.__init__, call the grandparent LM.__init__ directly
         LM.__init__(self)
@@ -150,7 +186,7 @@ class CATTransformerLM(HFLM):
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # load model
-        self._model = load_model(model_type, device=device)
+        self._model = load_model(model_type, device=device, model_path=model_path)
 
         # HFLM-expected attributes
         self._device = torch.device(device)
@@ -186,7 +222,7 @@ class CATTransformerLM(HFLM):
             device_type=self._device.type,
             dtype=self.mixed_precision_dtype,
         ):
-            if isinstance(self._model, CAT_Transformer):
+            if isinstance(self._model, (CAT_Transformer, CAT_Transformer_Hybrid)):
                 return self._model(inps, chunk_size_power=self.chunk_size_power)
             else:
                 return self._model(inps)
@@ -202,7 +238,7 @@ class CATTransformerLM(HFLM):
             dtype=self.mixed_precision_dtype,
         ):
             for _ in range(max_new_tokens):
-                if isinstance(self._model, CAT_Transformer):
+                if isinstance(self._model, (CAT_Transformer, CAT_Transformer_Hybrid)):
                     logits = self._model(cur, chunk_size_power=self.chunk_size_power)
                 else:
                     logits = self._model(cur)
@@ -221,7 +257,8 @@ class CATTransformerLM(HFLM):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate with lm-evaluation-harness")
-    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked")
+    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, vanilla2, chunked, cat_transformer_hybrid")
+    parser.add_argument("--model_path", type=str, default=None, help="Override model checkpoint path")
     parser.add_argument("--tasks", type=str, required=True, help="Comma-separated task names (e.g. hellaswag,arc_easy)")
     parser.add_argument("--chunk_size_power", type=int, default=4, help="Chunk size power for CAT (default: 4)")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size (default: 1)")
@@ -237,6 +274,7 @@ if __name__ == "__main__":
         chunk_size_power=args.chunk_size_power,
         device=args.device,
         batch_size=args.batch_size,
+        model_path=args.model_path,
     )
 
     task_list = [t.strip() for t in args.tasks.split(",")]
