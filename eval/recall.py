@@ -94,7 +94,8 @@ def get_tokenized_dataset(dataset_name):
         raise ValueError
 
 
-block_size = 1024
+block_size = 4096
+
 def _make_vanilla_transformer():
     config = TransformerConfig(
         vocab_size=50257,
@@ -117,7 +118,7 @@ def get_model(model_type, chunk_size=64, top_chunks=4):
         apply_block_sparse_attention(model, chunk_size=chunk_size, top_chunks=top_chunks)
 
     elif model_type == "chunked":
-        chunk_size = 16
+        chunk_size = 32
 
         compressor_config = CAT_Config(
             vocab_size=50257, # gpt2
@@ -160,16 +161,17 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     MAX_VAL_TOKENS = 100
 
-    vanilla_path = "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/12:07:04.421670/state_dict.pt"
+    # vanilla_path = "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/12:07:04.421670/state_dict.pt"
+    vanilla_path = "/scratch/jp7467/cat-transformer/Results/fineweb-15b/2026-03-16/13:24:52.608318/state_dict.pt"
     model_type_to_path = {
         "vanilla"      : vanilla_path,
         "block_sparse" : vanilla_path,
-        "chunked"      : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/15:40:25.010151/state_dict.pt",
+        "chunked"      : "/scratch/jp7467/cat-transformer/Results/fineweb-15b/2026-03-20/00:35:07.052056/state_dict.pt",
     }
 
-    # python eval/recall.py --model_type chunked --chunk_size_power 3
-    # python eval/recall.py --model_type vanilla
-    # python eval/recall.py --model_type block_sparse --bs_chunk_size 32 --bs_top_chunks 8
+    # python eval/recall.py --model_type chunked --chunk_size_power 2
+    # python eval/recall.py --model_type vanilla --chunk_size_power -1 --bs_chunk_size -1 --bs_top_chunks -1
+    # python eval/recall.py --model_type block_sparse --bs_chunk_size 32 --bs_top_chunks 32
     parser = argparse.ArgumentParser(description="Evaluate generation on retrieval tasks")
     parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked, block_sparse")
     parser.add_argument("--file_name", type=str, default="test", help="File name to save results")
@@ -197,7 +199,7 @@ if __name__ == "__main__":
     model.setup_cache(device=device)
 
     for dataset_name in [
-        # "hazyresearch/based-fda",
+        "hazyresearch/based-fda",
         "hazyresearch/based-swde",
     ]:
 
@@ -217,6 +219,7 @@ if __name__ == "__main__":
         print()
 
         bar = tqdm(range(N))
+        # bar = tqdm(range(100))
         for i in bar:
             num_value_tokens = len(tokenized_value[i])
 
@@ -270,7 +273,7 @@ if __name__ == "__main__":
 
         print("Dumping results to csv...")
 
-        folder_path = "benchmark_logs_v2/evaporate_rope_ablation"
+        folder_path = "benchmark_logs_v2/rebuttal_block_sparse"
         os.makedirs(folder_path, exist_ok=True)
 
         # convert to dataframe
