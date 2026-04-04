@@ -21,6 +21,8 @@ from cat_transformer_adaptive import (
     CAT_Transformer
 )
 
+from block_sparse_attention import apply_block_sparse_attention
+
 @torch.no_grad()
 def generate_autoregressive(input_ids, model, num_new_tokens=48, do_sample=False, chunk_size_power=None):
     """Simple autoregressive generation (slow but correct). Works for both Transformer and CAT_Transformer."""
@@ -93,18 +95,26 @@ def get_tokenized_dataset(dataset_name):
 
 
 block_size = 1024
-def get_model(model_type):
+def _make_vanilla_transformer():
+    config = TransformerConfig(
+        vocab_size=50257,
+        block_size=block_size,
+        dim=1024,
+        n_head=16,
+        n_layer=12,
+        use_qk_norm=True,
+        use_fused_ops=True,
+    )
+    return Transformer(config)
+
+
+def get_model(model_type, chunk_size=64, top_chunks=4):
     if model_type == "vanilla":
-        config = TransformerConfig(
-            vocab_size=50257, # gpt2
-            block_size=block_size,
-            dim=1024,
-            n_head=16,
-            n_layer=12,
-            use_qk_norm=True,
-            use_fused_ops=True,
-        )
-        model = Transformer(config)
+        model = _make_vanilla_transformer()
+
+    elif model_type == "block_sparse":
+        model = _make_vanilla_transformer()
+        apply_block_sparse_attention(model, chunk_size=chunk_size, top_chunks=top_chunks)
 
     elif model_type == "chunked":
         chunk_size = 16
@@ -150,24 +160,29 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     MAX_VAL_TOKENS = 100
 
+    vanilla_path = "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/12:07:04.421670/state_dict.pt"
     model_type_to_path = {
-        "vanilla" : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/12:07:04.421670/state_dict.pt",
-        "chunked" : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/15:40:25.010151/state_dict.pt",
+        "vanilla"      : vanilla_path,
+        "block_sparse" : vanilla_path,
+        "chunked"      : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/15:40:25.010151/state_dict.pt",
     }
 
     # python eval/recall.py --model_type chunked --chunk_size_power 3
-    # setup arg parser
+    # python eval/recall.py --model_type vanilla
+    # python eval/recall.py --model_type block_sparse --bs_chunk_size 32 --bs_top_chunks 8
     parser = argparse.ArgumentParser(description="Evaluate generation on retrieval tasks")
-    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked")
+    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked, block_sparse")
     parser.add_argument("--file_name", type=str, default="test", help="File name to save results")
     parser.add_argument("--chunk_size_power", type=int, default=4, help="Chunk size power (default: 4)")
+    parser.add_argument("--bs_chunk_size", type=int, default=64, help="Block-sparse: tokens per chunk (default: 64)")
+    parser.add_argument("--bs_top_chunks", type=int, default=4, help="Block-sparse: top-K chunks to attend to (default: 4)")
 
     args = parser.parse_args()
     model_type = args.model_type
     model_path = model_type_to_path[model_type]
     file_name = args.file_name
 
-    model = get_model(model_type)
+    model = get_model(model_type, chunk_size=args.bs_chunk_size, top_chunks=args.bs_top_chunks)
     print(model)
 
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
@@ -236,6 +251,8 @@ if __name__ == "__main__":
         results = {
             "model_type": model_type,
             "chunk_size_power": args.chunk_size_power,
+            "bs_chunk_size": args.bs_chunk_size,
+            "bs_top_chunks": args.bs_top_chunks,
             "dataset_name": dataset_name,
             "acc": acc.mean(),
             "num_samples": len(acc),
