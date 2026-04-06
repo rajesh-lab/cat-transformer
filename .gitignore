@@ -210,3 +210,12 @@ __marimo__/
 
 # ignore benchmark logs 
 *.csv 
+
+dataset/
+
+Results/
+
+eval/*.json
+eval/results/
+eval/llama_results/
+eval/gpt2_15b/
