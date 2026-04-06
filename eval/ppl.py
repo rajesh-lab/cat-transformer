@@ -1,5 +1,6 @@
+# single file eval for perplexity
 """
-Perplexity evaluation on PG19 (test split) with 2K context length.
+Perplexity evaluation on PG19 (test split).
 
 Usage:
     python eval/ppl.py --model_type vanilla
@@ -24,16 +25,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from transformer import TransformerConfig, Transformer
 from cat_transformer_adaptive import CAT_Config, CAT_Transformer
 
+# fill in the correct hyper-parameters
 BLOCK_SIZE = 2048
 VOCAB_SIZE = 32000
 TOKENIZER_NAME = "meta-llama/Llama-2-7b-hf"
 
+# fill in the correct paths
 MODEL_TYPE_TO_PATH = {
-    "vanilla": "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-08/20:35:53.414785/state_dict.pt",
-    "chunked": "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-07/17:35:43.210462/state_dict.pt",
+    "vanilla": "/path/to/model",
+    "chunked": "/path/to/model",
 }
 
 
+# fill in the correct hyper-parameters
 def get_model(model_type):
     if model_type == "vanilla":
         config = TransformerConfig(

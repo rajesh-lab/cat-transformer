@@ -1,6 +1,5 @@
 # Inspired from: https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py
-# and some o3 edits
-# uses dataset in the folder: /scratch/jp7467/Datasets/fineweb-50b
+# Custom data loader
 
 import os
 import numpy as np
@@ -96,11 +95,6 @@ class TokenBatchIterable(torch.utils.data.IterableDataset):
             buf = self.tokens[self.pos : self.pos + B * T].clone() # clone for safety
             buf = buf.view(B, T)  # (B, L+1) for next-token prediction
 
-            # different slices according to the model
-            # if "chunked" in self.model_name:
-            #     x = buf[:, :-1]
-            #     y = buf[:, :-1].clone()
-            # else:
             x = buf[:, :-1]
             y = buf[:, 1:].clone()
 

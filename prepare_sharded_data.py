@@ -1,11 +1,5 @@
-"""
-FineWeb-Edu dataset (for srs pretraining)
-https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
-Downloads and tokenizes the data and saves data shards to disk.
-Run simply as:
-$ python fineweb.py
-Will save shards to the local directory "edu_fineweb10B".
-"""
+# prepare tokenized shards for pre-training
+# run using: python prepare_sharded_data.py
 
 import os
 import multiprocessing as mp
@@ -14,53 +8,18 @@ from datasets import load_dataset  # pip install datasets
 from tqdm import tqdm  # pip install tqdm
 from transformers import AutoTokenizer  # pip install transformers
 
-# ------------------------------------------
-local_dir = "/scratch/jp7467/Datasets/fineweb-50b-llama2"
+# --------------------------------------------------------------------------------------------
+# please decide paths! and other options
+# and then run :)
+
+local_dir = "Datasets/fineweb-15b-gpt2"
 dataset_name = "HuggingFaceFW/fineweb-edu"
 remote_name = "sample-100BT"
 shard_size = 100_000_000  # 500M tokens per shard
 use_eos_token = True # append EOS token before each document
-# TOKENIZER_NAME = "gpt2"
-TOKENIZER_NAME = "meta-llama/Llama-2-7b-hf"
+TOKENIZER_NAME = "gpt2"
 
-# local_dir = "/gpfs/data/ranganathlab/Jatin/Datasets/wikitext-sharded-fixed"
-# dataset_name = "wikitext"
-# remote_name = "wikitext-103-raw-v1"
-# shard_size = 50_000_000  # 50M tokens per shard, total of ~3 shards
-# use_eos_token = False
-# TOKENIZER_NAME = "meta-llama/Llama-2-7b-hf"
-# import re
-# def wt_detokenizer(string):
-#     # contractions
-#     string = string.replace("s '", "s'")
-#     string = re.sub(r"/' [0-9]/", r"/'[0-9]/", string)
-#     # number separators
-#     string = string.replace(" @-@ ", "-")
-#     string = string.replace(" @,@ ", ",")
-#     string = string.replace(" @.@ ", ".")
-#     # punctuation
-#     string = string.replace(" : ", ": ")
-#     string = string.replace(" ; ", "; ")
-#     string = string.replace(" . ", ". ")
-#     string = string.replace(" ! ", "! ")
-#     string = string.replace(" ? ", "? ")
-#     string = string.replace(" , ", ", ")
-#     # double brackets
-#     string = re.sub(r"\(\s*([^\)]*?)\s*\)", r"(\1)", string)
-#     string = re.sub(r"\[\s*([^\]]*?)\s*\]", r"[\1]", string)
-#     string = re.sub(r"{\s*([^}]*?)\s*}", r"{\1}", string)
-#     string = re.sub(r"\"\s*([^\"]*?)\s*\"", r'"\1"', string)
-#     string = re.sub(r"'\s*([^']*?)\s*'", r"'\1'", string)
-#     # miscellaneous
-#     string = string.replace("= = = =", "====")
-#     string = string.replace("= = =", "===")
-#     string = string.replace("= =", "==")
-#     string = string.replace(" " + chr(176) + " ", chr(176))
-#     string = string.replace(" \n", "\n")
-#     string = string.replace("\n ", "\n")
-#     string = string.replace(" N ", " 1 ")
-#     string = string.replace(" 's", "'s")
-#     return string
+# --------------------------------------------------------------------------------------------
 
 # Choose the HF tokenizer (default: GPT-2, 50k vocab -> fits uint16)
 DTYPE = np.uint16  # if you use a tokenizer with vocab > 65535, switch to np.uint32
@@ -74,7 +33,7 @@ fw = load_dataset(dataset_name, name=remote_name, split="train")
 fw = fw.train_test_split(test_size=0.01, shuffle=False, seed=42)
 
 fw = fw["train"]  # use train split for now
-fw = fw.shard(num_shards=2, index=0)  # first ~50B tokens
+fw = fw.shard(num_shards=6, index=0)  # first ~16B tokens
 
 print(fw)
 
@@ -107,7 +66,6 @@ def tokenize(doc):
     # tokenizes a single document and returns a numpy array of tokens
     tok, eot = _get_tokenizer()
     ids = tok.encode(doc["text"], add_special_tokens=False)
-    # ids = tok.encode(wt_detokenizer(doc["text"]), add_special_tokens=False)
 
     if use_eos_token:
         tokens = [eot]

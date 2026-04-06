@@ -1,3 +1,6 @@
+# Custom eval code for recall
+# Now depracted due to `eval/harness.py`
+
 import os
 import sys
 import numpy as np
@@ -149,6 +152,7 @@ if __name__ == "__main__":
     device = "cuda"
     dtype = torch.bfloat16
     MAX_VAL_TOKENS = 100
+
 
     model_type_to_path = {
         "vanilla" : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/12:07:04.421670/state_dict.pt",

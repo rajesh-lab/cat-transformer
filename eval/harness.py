@@ -2,21 +2,13 @@
 lm-evaluation-harness wrapper for Transformer and CAT_Transformer models.
 
 Usage:
-    python eval/harness.py --model_type chunked --tasks hellaswag,arc_easy
+    python eval/harness.py --model_type vanilla \
+    --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_2,niah_single_3 --metadata '{"max_seq_lengths":[2048,4096]}' \
+    --output_path eval/harness_vanilla.json
 
-    python eval/harness.py --model_type vanilla2 --chunk_size_power 2 \
-    --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_1,niah_single_3 --metadata '{"max_seq_lengths":[2048,4096]}' \
-    --limit 10 --output_path eval/test.json
-
-    python eval/harness.py --model_type chunked --chunk_size_power 3 --tasks niah_single_1 --metadata '{"max_seq_lengths":[1024]}' --output_path eval/test.json
-
-    # wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_1
-    # swde,fda
-    # niah_single_1 --metadata '{"max_seq_lengths":[1024]}'
-    # niah_single_2 --metadata '{"max_seq_lengths":[1024]}'
-
-    python eval/harness.py --model_type chunked --chunk_size_power 2 --tasks niah_single_1 --limit 100 --metadata '{"max_seq_lengths":[1024]}'
-
+    python eval/harness.py --model_type chunked --chunk_size_power 3 \
+    --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_2,niah_single_3 --metadata '{"max_seq_lengths":[2048,4096]}' \
+    --output_path eval/harness_cat_transformer.json
 """
 
 from __future__ import annotations
@@ -38,28 +30,17 @@ import lm_eval
 from lm_eval.api.model import LM
 from lm_eval.models.huggingface import HFLM
 
-# BLOCK_SIZE = 2048
+# fill in the right details below!
+
 BLOCK_SIZE = 4096
 
 MODEL_TYPE_TO_PATH = {
-    
-    # "vanilla": "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/12:07:04.421670/state_dict.pt",
-    # "chunked": "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/15:40:25.010151/state_dict.pt",
-
-    # llama2 tokenization -- 10B tokens, 2K context, D=1024
-    # "vanilla" : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-08/20:35:53.414785/state_dict.pt",
-    # "chunked" : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-07/17:35:43.210462/state_dict.pt", # chunk_size=4,8,16,32
-
-    # gpt2 -- 15B tokens, 4K context, D=1024
-    "vanilla" : "/scratch/jp7467/cat-transformer/Results/fineweb-15b/2026-03-16/13:24:52.608318/state_dict.pt", # 12L
-    "vanilla2" : "/scratch/jp7467/cat-transformer/Results/fineweb-15b/2026-03-16/13:34:38.920977/state_dict.pt", # 24L
+    "vanilla": "/path/to/model",
+    "chunked": "/path/to/model",
 }
 
 TOKENIZER_NAME = "gpt2"
 VOCAB_SIZE = 50257
-
-# TOKENIZER_NAME = "meta-llama/Llama-2-7b-hf"
-# VOCAB_SIZE = 32000
 
 def get_model(model_type):
     if model_type == "vanilla":
@@ -128,6 +109,7 @@ def load_model(model_type, device="cuda"):
     return model
 
 
+# Wrapper to use the harness with cat-transformer
 class CATTransformerLM(HFLM):
     """lm-evaluation-harness wrapper for Transformer and CAT_Transformer."""
 
