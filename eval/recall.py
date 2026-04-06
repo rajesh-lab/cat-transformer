@@ -189,10 +189,10 @@ if __name__ == "__main__":
     model_type_to_path = {
         "vanilla" : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/12:07:04.421670/state_dict.pt",
         "chunked" : "/scratch/jp7467/cat-transformer/Results/test-fineweb-1b/2026-03-06/15:40:25.010151/state_dict.pt",
-        "cat_transformer_hybrid" : "/gpfs/data/ranganathlab/Jatin/cat-transformer/Results/fineweb-5b/2026-03-28/01:25:03.783948/intermediate_state_dict_0033750.pt",
+        "cat_transformer_hybrid" : "/gpfs/data/ranganathlab/Jatin/cat-transformer/Results/fineweb-5b/2026-03-28/01:25:03.783948/state_dict.pt",
     }
 
-    # python eval/recall.py --model_type cat_transformer_hybrid --chunk_size_power 4
+    # python eval/recall.py --model_type cat_transformer_hybrid --chunk_size_power 2 --file_name hyb_cat
     # setup arg parser
     parser = argparse.ArgumentParser(description="Evaluate generation on retrieval tasks")
     parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked, cat_transformer_hybrid")
@@ -291,7 +291,7 @@ if __name__ == "__main__":
 
         print("Dumping results to csv...")
 
-        folder_path = "benchmark_logs_v2/evaporate_rope_ablation"
+        folder_path = "eval/hybrid_cat"
         os.makedirs(folder_path, exist_ok=True)
 
         # convert to dataframe

@@ -152,7 +152,7 @@ if __name__ == "__main__":
     }
 
     # python eval/niah.py --model_type cat_transformer_hybrid --chunk_size_power 2
-    # python eval/niah.py --model_type cat_transformer_hybrid --chunk_size_power 4 --datasets "niah-numbers-1k" --file_name hybrid_niah
+    # python eval/niah.py --model_type cat_transformer_hybrid --chunk_size_power 2 --datasets "niah-numbers-1k" --file_name test
 
     parser = argparse.ArgumentParser(description="NIAH evaluation using RULER benchmark")
     parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked, cat_transformer_hybrid")
@@ -260,7 +260,7 @@ if __name__ == "__main__":
 
         print("Dumping results to csv...")
 
-        folder_path = "benchmark_logs_v2/niah_v2"
+        folder_path = "eval/hybrid_cat"
         os.makedirs(folder_path, exist_ok=True)
 
         df = pd.DataFrame(results, index=[0])
