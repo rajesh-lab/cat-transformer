@@ -239,6 +239,8 @@ Then refer to `run.sh` for some sample commands to run training.
 
 Finally, once the model is trained, please refer to `eval/harness.py` to perform evaluations.
 
+Refer to `sample_run.sh` to look at the training command. Feel free to modify it.
+
 # Acknowledgements
 This implementation borrows heavily from the following repositories:
 

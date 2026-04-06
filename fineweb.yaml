@@ -1,6 +1,6 @@
 hydra:
   run:
-    dir: Results/hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: Results/hydra_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S} # change dir for hydra outputs!
   job:
     chdir: false
 
@@ -14,15 +14,11 @@ seed: 42
 dataset:
     name: fineweb
 
-    path: /scratch/jp7467/cat-transformer/dataset/fineweb-10b
+    path: Datasets/fineweb-15b # change dataset path accordingly!
     tokenizer_name: "gpt2"
     vocab_size: 50257
 
-    # path: /scratch/jp7467/cat-transformer/dataset/fineweb-10b-llama2
-    # tokenizer_name: "meta-llama/Llama-2-7b-hf"
-    # vocab_size: 32000
-
-results_dir: Results
+results_dir: Results # change dir for dumping results
 
 wandb:
     project: fineweb-15b
