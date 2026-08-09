@@ -11,6 +11,8 @@ python generate.py \
 --model_path "/path/to/model" \
 --prompt "The meaning of life is"
 
+model_type is one of: vanilla, chunked (CAT), beacon (Activation Beacon).
+
 """
 
 import os
@@ -24,6 +26,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from transformer import TransformerConfig, Transformer
 from cat_transformer_adaptive import CAT_Config, CAT_Transformer
+from beacon_transformer import Beacon_Config, Beacon_Transformer
+from cat_lookback_transformer import CAT_Lookback_Transformer
+
+# models that take a chunk_size_power at forward time
+ADAPTIVE_MODELS = (CAT_Transformer, CAT_Lookback_Transformer, Beacon_Transformer)
 
 block_size = 4096 # context length
 
@@ -65,6 +72,47 @@ def get_model(model_type):
         )
         return CAT_Transformer(decoder_config, compressor_config)
 
+    elif model_type == "chunked_lookback":
+        chunk_size = 32
+        compressor_config = CAT_Config(
+            vocab_size=50257,
+            block_size=block_size,
+            chunk_size=chunk_size,
+            dim=1024,
+            n_head=16,
+            n_layer=3,
+            dim_fx=2048,
+            use_qk_norm=True,
+            # we don't use fused ops here due to no support of vmap in liger-kernels :((
+        )
+        decoder_config = CAT_Config(
+            vocab_size=50257,
+            block_size=block_size,
+            chunk_size=chunk_size,
+            dim=2048,
+            n_head=32,
+            n_layer=12,
+            use_qk_norm=True,
+            use_fused_ops=True,
+        )
+        return CAT_Lookback_Transformer(decoder_config, compressor_config)
+
+    elif model_type == "beacon":
+        config = Beacon_Config(
+            vocab_size=50257,
+            block_size=block_size,
+            chunk_size=32,
+            n_beacons=1,
+            # must match the checkpoint being loaded
+            rope_position_scheme="chunk_reset",
+            dim=1024,
+            n_head=16,
+            n_layer=12,
+            use_qk_norm=False,
+            use_fused_ops=True,
+        )
+        return Beacon_Transformer(config)
+
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -73,7 +121,7 @@ def get_model(model_type):
 def generate(input_ids, model, num_new_tokens=100, do_sample=True, temperature=0.8, chunk_size_power=None):
     cur = input_ids.clone()
     for _ in range(num_new_tokens):
-        if isinstance(model, CAT_Transformer):
+        if isinstance(model, ADAPTIVE_MODELS):
             logits = model(cur, chunk_size_power=chunk_size_power)
         else:
             logits = model(cur)
@@ -89,7 +137,7 @@ def generate(input_ids, model, num_new_tokens=100, do_sample=True, temperature=0
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, required=True, choices=["vanilla", "chunked"])
+    parser.add_argument("--model_type", type=str, required=True, choices=["vanilla", "chunked", "chunked_lookback", "beacon"])
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--prompt", type=str, default="The meaning of life is")
     parser.add_argument("--num_tokens", type=int, default=100)

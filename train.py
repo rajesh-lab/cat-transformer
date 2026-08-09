@@ -43,7 +43,7 @@ def main(cfg: DictConfig):
     seed_everything(cfg.seed)
 
     if accelerate.is_main_process:
-        datetime_str = str(datetime.datetime.now())
+        datetime_str = datetime.datetime.now().strftime("%Y-%m-%d %H-%M-%S.%f")
         experiment_name = get_experiment_name(cfg, datetime_str, accelerate)
         result_dir = create_results_dir(cfg, datetime_str, accelerate)
         cfg.result_dir = result_dir
@@ -109,12 +109,13 @@ def main(cfg: DictConfig):
     # get model
     model = get_model(accelerate, cfg)
 
-    is_cat = (cfg.model.name == "cat_transformer")
-    if is_cat:
+    # models that cycle through chunk sizes during training and are validated at each one
+    is_adaptive = cfg.model.name in ("cat_transformer", "cat_lookback_transformer", "beacon_transformer")
+    if is_adaptive:
         max_power = int(math.log2(cfg.model.chunk_size))
-        min_power = 2  # chunk_size = 4
+        min_power = int(math.log2(cfg.model.get("min_chunk_size", 4)))
         chunk_size_powers = list(range(min_power, max_power + 1))
-        accelerate.print(f"CAT chunk_size_powers: {chunk_size_powers} (sizes: {[2**p for p in chunk_size_powers]})")
+        accelerate.print(f"{cfg.model.name} chunk_size_powers: {chunk_size_powers} (sizes: {[2**p for p in chunk_size_powers]})")
 
     accelerate.print("*****************************************************************")
     accelerate.print(f"Using #GPUs:", accelerate.num_processes)
@@ -183,7 +184,7 @@ def main(cfg: DictConfig):
             param_group["lr"] = lr
 
         with accelerate.autocast():
-            if is_cat:
+            if is_adaptive:
                 chunk_size_power = chunk_size_powers[iter_num % len(chunk_size_powers)]
                 original_loss = model(input_ids, targets, chunk_size_power=chunk_size_power)
             else:
@@ -207,7 +208,7 @@ def main(cfg: DictConfig):
                     "train/loss": original_loss.item(),
                     "perf/Ktokens_s" : token_throughput,
                 }
-                if is_cat:
+                if is_adaptive:
                     log_dict["extra/train_chunk_size_power"] = chunk_size_power
                 wandb.log(log_dict)
                 if cfg.train.grad_norm > 0 and iter_num % cfg.train.grad_norm_interval == 0:
@@ -226,7 +227,7 @@ def main(cfg: DictConfig):
         if (iter_num % cfg.eval.eval_interval == 0) and (iter_num > 0) :
             
             accelerate.print("Validating log loss...")
-            if is_cat:
+            if is_adaptive:
                 val_results = validate(accelerate, model, test_dataloader, cfg, chunk_size_powers=chunk_size_powers)
                 if accelerate.is_main_process:
                     max_power = chunk_size_powers[-1]
@@ -266,7 +267,7 @@ def main(cfg: DictConfig):
    
     # perform a full validation at the end
     accelerate.print("Validating log loss...")
-    if is_cat:
+    if is_adaptive:
         val_results = validate(accelerate, model, test_dataloader, cfg, chunk_size_powers=chunk_size_powers)
         if accelerate.is_main_process:
             max_power = chunk_size_powers[-1]

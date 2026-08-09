@@ -219,3 +219,9 @@ eval/*.json
 eval/results/
 eval/llama_results/
 eval/gpt2_15b/
+
+run.sh
+
+slurm_logs/
+
+eval_data/

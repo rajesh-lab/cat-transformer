@@ -24,12 +24,24 @@ from cat_transformer_adaptive import (
     CAT_Transformer
 )
 
+from beacon_transformer import (
+    Beacon_Config,
+    Beacon_Transformer
+)
+
+from cat_lookback_transformer import (
+    CAT_Lookback_Transformer
+)
+
+# models that take a chunk_size_power at forward time
+ADAPTIVE_MODELS = (CAT_Transformer, CAT_Lookback_Transformer, Beacon_Transformer)
+
 @torch.no_grad()
 def generate_autoregressive(input_ids, model, num_new_tokens=48, do_sample=False, chunk_size_power=None):
     """Simple autoregressive generation (slow but correct). Works for both Transformer and CAT_Transformer."""
     cur_input_ids = input_ids.clone()
     for _ in range(num_new_tokens):
-        if isinstance(model, CAT_Transformer):
+        if isinstance(model, ADAPTIVE_MODELS):
             logits = model(cur_input_ids, chunk_size_power=chunk_size_power)
         else:
             logits = model(cur_input_ids)
@@ -95,8 +107,7 @@ def get_tokenized_dataset(dataset_name):
         raise ValueError
 
 
-block_size = 1024
-def get_model(model_type):
+def get_model(model_type, rope_position_scheme="chunk_reset", dim=2048, compressor_dim=1024, block_size=4096):
     if model_type == "vanilla":
         config = TransformerConfig(
             vocab_size=50257, # gpt2
@@ -142,6 +153,62 @@ def get_model(model_type):
 
         model = CAT_Transformer(decoder_config, compressor_config)
 
+    elif model_type == "chunked_lookback":
+        # keep in sync with the cat_lookback_transformer block in submit.sh
+        chunk_size = 32
+
+        compressor_config = CAT_Config(
+            vocab_size=50257, # gpt2
+            block_size=block_size,
+            chunk_size=chunk_size,
+
+            dim=compressor_dim,
+            n_head=compressor_dim // 64,
+            n_layer=3,
+
+            dim_fx=dim,
+
+            use_qk_norm=False,
+            # we don't use fused ops here due to no support of vmap in liger-kernels :((
+        )
+
+        decoder_config = CAT_Config(
+            vocab_size=50257, # gpt2
+            block_size=block_size,
+            chunk_size=chunk_size,
+
+            dim=dim,
+            n_head=dim // 64,
+            n_local_heads=-1,
+            n_layer=12,
+
+            use_qk_norm=False,
+            use_fused_ops=True,
+        )
+
+        model = CAT_Lookback_Transformer(decoder_config, compressor_config)
+
+    elif model_type == "beacon":
+        # keep in sync with the beacon_transformer block in submit.sh
+        config = Beacon_Config(
+            vocab_size=50257, # gpt2
+            block_size=block_size,
+
+            chunk_size=32,
+            n_beacons=1,
+            # must match the checkpoint: the scheme changes what the weights mean
+            rope_position_scheme=rope_position_scheme,
+
+            dim=2048,
+            n_head=32,
+            n_local_heads=-1,
+            n_layer=12,
+
+            use_qk_norm=False,
+            use_fused_ops=True,
+        )
+        model = Beacon_Transformer(config)
+
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -160,18 +227,41 @@ if __name__ == "__main__":
     }
 
     # python eval/recall.py --model_type chunked --chunk_size_power 3
+    # python eval/recall.py --model_type beacon --chunk_size_power 5 --model_path /path/to/state_dict.pt
     # setup arg parser
     parser = argparse.ArgumentParser(description="Evaluate generation on retrieval tasks")
-    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked")
+    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked, chunked_lookback, beacon")
+    parser.add_argument("--model_path", type=str, default=None, help="Checkpoint path (defaults to the built-in table)")
     parser.add_argument("--file_name", type=str, default="test", help="File name to save results")
     parser.add_argument("--chunk_size_power", type=int, default=4, help="Chunk size power (default: 4)")
+    parser.add_argument("--datasets", type=str, default="hazyresearch/based-swde,hazyresearch/based-fda",
+                        help="Comma-separated dataset names")
+    parser.add_argument("--output_dir", type=str, default="benchmark_logs_v2/evaporate_rope_ablation",
+                        help="Directory for the results csv")
+    parser.add_argument("--rope_position_scheme", type=str, default="chunk_reset",
+                        choices=["chunk_reset", "compact"],
+                        help="Beacon RoPE scheme, must match the one the checkpoint was trained with")
+    parser.add_argument("--dim", type=int, default=2048, help="chunked_lookback decoder width")
+    parser.add_argument("--compressor_dim", type=int, default=1024, help="chunked_lookback compressor width")
+    # Samples longer than this are skipped. The 4K default matches what the 4096-context
+    # models were trained at; at 1024 only 93 of FDA's 1102 documents survive the filter.
+    parser.add_argument("--block_size", type=int, default=4096, help="context length to evaluate at")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Optional cap on scored samples per dataset, for smoke tests")
 
     args = parser.parse_args()
+    block_size = args.block_size
     model_type = args.model_type
-    model_path = model_type_to_path[model_type]
+    model_path = args.model_path if args.model_path is not None else model_type_to_path[model_type]
     file_name = args.file_name
 
-    model = get_model(model_type)
+    model = get_model(
+        model_type,
+        rope_position_scheme=args.rope_position_scheme,
+        dim=args.dim,
+        compressor_dim=args.compressor_dim,
+        block_size=block_size,
+    )
     print(model)
 
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
@@ -185,10 +275,7 @@ if __name__ == "__main__":
     model.to(device=device)
     model.setup_cache(device=device)
 
-    for dataset_name in [
-        # "hazyresearch/based-fda",
-        "hazyresearch/based-swde",
-    ]:
+    for dataset_name in [d.strip() for d in args.datasets.split(",") if d.strip()]:
 
         acc = list()
 
@@ -207,6 +294,9 @@ if __name__ == "__main__":
 
         bar = tqdm(range(N))
         for i in bar:
+            if args.max_samples is not None and len(acc) >= args.max_samples:
+                break
+
             num_value_tokens = len(tokenized_value[i])
 
             if (num_value_tokens > MAX_VAL_TOKENS) or (len(tokenized_text[i]) + len(tokenized_value[i]) >= block_size - 50):
@@ -245,6 +335,7 @@ if __name__ == "__main__":
             "num_samples": len(acc),
             "num_correct": np.sum(acc),
             "max_val_tokens": MAX_VAL_TOKENS,
+            "block_size": block_size,
             "model_path": model_path,
         }
 
@@ -257,7 +348,7 @@ if __name__ == "__main__":
 
         print("Dumping results to csv...")
 
-        folder_path = "benchmark_logs_v2/evaporate_rope_ablation"
+        folder_path = args.output_dir
         os.makedirs(folder_path, exist_ok=True)
 
         # convert to dataframe

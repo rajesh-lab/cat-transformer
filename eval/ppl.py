@@ -6,6 +6,7 @@ Usage:
     python eval/ppl.py --model_type vanilla
     python eval/ppl.py --model_type chunked --chunk_size_power 4
     python eval/ppl.py --model_type chunked --chunk_size_power 3 --output_path eval/results/ppl_cat8.json
+    python eval/ppl.py --model_type beacon --chunk_size_power 4
 """
 
 import os
@@ -24,6 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transformer import TransformerConfig, Transformer
 from cat_transformer_adaptive import CAT_Config, CAT_Transformer
+from beacon_transformer import Beacon_Config, Beacon_Transformer
+from cat_lookback_transformer import CAT_Lookback_Transformer
+
+ADAPTIVE_MODELS = (CAT_Transformer, CAT_Lookback_Transformer, Beacon_Transformer)
 
 # fill in the correct hyper-parameters
 BLOCK_SIZE = 2048
@@ -34,6 +39,7 @@ TOKENIZER_NAME = "meta-llama/Llama-2-7b-hf"
 MODEL_TYPE_TO_PATH = {
     "vanilla": "/path/to/model",
     "chunked": "/path/to/model",
+    "beacon": "/path/to/model",
 }
 
 
@@ -74,6 +80,46 @@ def get_model(model_type):
             use_fused_ops=True,
         )
         return CAT_Transformer(decoder_config, compressor_config)
+
+    elif model_type == "chunked_lookback":
+        chunk_size = 32
+        compressor_config = CAT_Config(
+            vocab_size=VOCAB_SIZE,
+            block_size=BLOCK_SIZE,
+            chunk_size=chunk_size,
+            dim=1024,
+            n_head=16,
+            n_layer=3,
+            dim_fx=2048,
+            use_qk_norm=True,
+        )
+        decoder_config = CAT_Config(
+            vocab_size=VOCAB_SIZE,
+            block_size=BLOCK_SIZE,
+            chunk_size=chunk_size,
+            dim=2048,
+            n_head=32,
+            n_layer=12,
+            use_qk_norm=True,
+            use_fused_ops=True,
+        )
+        return CAT_Lookback_Transformer(decoder_config, compressor_config)
+
+    elif model_type == "beacon":
+        config = Beacon_Config(
+            vocab_size=VOCAB_SIZE,
+            block_size=BLOCK_SIZE,
+            chunk_size=32,
+            n_beacons=1,
+            # must match the checkpoint being loaded
+            rope_position_scheme="chunk_reset",
+            dim=1024,
+            n_head=16,
+            n_layer=12,
+            use_qk_norm=False,
+            use_fused_ops=True,
+        )
+        return Beacon_Transformer(config)
 
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -121,7 +167,7 @@ def evaluate_perplexity(model, chunks, model_type, chunk_size_power, device, dty
         input_ids = chunks[i].unsqueeze(0).to(device)  # (1, context_length)
 
         with torch.autocast(device_type=device, dtype=dtype):
-            if isinstance(model, CAT_Transformer):
+            if isinstance(model, ADAPTIVE_MODELS):
                 logits = model(input_ids, chunk_size_power=chunk_size_power)
             else:
                 logits = model(input_ids)
@@ -146,8 +192,8 @@ def evaluate_perplexity(model, chunks, model_type, chunk_size_power, device, dty
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate perplexity on PG19 (test split)")
-    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked")
-    parser.add_argument("--chunk_size_power", type=int, default=4, help="Chunk size power for CAT (default: 4)")
+    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked, chunked_lookback, beacon")
+    parser.add_argument("--chunk_size_power", type=int, default=4, help="Chunk size power for CAT / beacon (default: 4)")
     parser.add_argument("--context_length", type=int, default=2048, help="Context length (default: 2048)")
     parser.add_argument("--device", type=str, default="cuda", help="Device (default: cuda)")
     parser.add_argument("--limit", type=int, default=None, help="Max number of chunks to evaluate")

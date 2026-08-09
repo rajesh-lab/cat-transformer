@@ -1,5 +1,5 @@
 """
-lm-evaluation-harness wrapper for Transformer and CAT_Transformer models.
+lm-evaluation-harness wrapper for Transformer, CAT_Transformer and Beacon_Transformer models.
 
 Usage:
     python eval/harness.py --model_type vanilla \
@@ -9,6 +9,10 @@ Usage:
     python eval/harness.py --model_type chunked --chunk_size_power 3 \
     --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_2,niah_single_3 --metadata '{"max_seq_lengths":[2048,4096]}' \
     --output_path eval/harness_cat_transformer.json
+
+    python eval/harness.py --model_type beacon --chunk_size_power 3 \
+    --tasks wikitext,lambada_openai,hellaswag,winogrande,arc_easy,swde,fda,niah_single_2,niah_single_3 --metadata '{"max_seq_lengths":[2048,4096]}' \
+    --output_path eval/harness_beacon_transformer.json
 """
 
 from __future__ import annotations
@@ -25,6 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transformer import TransformerConfig, Transformer
 from cat_transformer_adaptive import CAT_Config, CAT_Transformer
+from beacon_transformer import Beacon_Config, Beacon_Transformer
+from cat_lookback_transformer import CAT_Lookback_Transformer
 
 import lm_eval
 from lm_eval.api.model import LM
@@ -37,7 +43,11 @@ BLOCK_SIZE = 4096
 MODEL_TYPE_TO_PATH = {
     "vanilla": "/path/to/model",
     "chunked": "/path/to/model",
+    "beacon": "/path/to/model",
 }
+
+# models that take a chunk_size_power at forward time
+ADAPTIVE_MODELS = (CAT_Transformer, CAT_Lookback_Transformer, Beacon_Transformer)
 
 TOKENIZER_NAME = "gpt2"
 VOCAB_SIZE = 50257
@@ -90,6 +100,46 @@ def get_model(model_type):
             use_fused_ops=True,
         )
         return CAT_Transformer(decoder_config, compressor_config)
+
+    elif model_type == "chunked_lookback":
+        chunk_size = 32
+        compressor_config = CAT_Config(
+            vocab_size=VOCAB_SIZE,
+            block_size=BLOCK_SIZE,
+            chunk_size=chunk_size,
+            dim=1024,
+            n_head=16,
+            n_layer=3,
+            dim_fx=2048,
+            use_qk_norm=True,
+        )
+        decoder_config = CAT_Config(
+            vocab_size=VOCAB_SIZE,
+            block_size=BLOCK_SIZE,
+            chunk_size=chunk_size,
+            dim=2048,
+            n_head=32,
+            n_layer=12,
+            use_qk_norm=True,
+            use_fused_ops=True,
+        )
+        return CAT_Lookback_Transformer(decoder_config, compressor_config)
+
+    elif model_type == "beacon":
+        config = Beacon_Config(
+            vocab_size=VOCAB_SIZE,
+            block_size=BLOCK_SIZE,
+            chunk_size=32,
+            n_beacons=1,
+            # must match the checkpoint being loaded
+            rope_position_scheme="chunk_reset",
+            dim=1024,
+            n_head=16,
+            n_layer=12,
+            use_qk_norm=False,
+            use_fused_ops=True,
+        )
+        return Beacon_Transformer(config)
 
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -168,7 +218,7 @@ class CATTransformerLM(HFLM):
             device_type=self._device.type,
             dtype=self.mixed_precision_dtype,
         ):
-            if isinstance(self._model, CAT_Transformer):
+            if isinstance(self._model, ADAPTIVE_MODELS):
                 return self._model(inps, chunk_size_power=self.chunk_size_power)
             else:
                 return self._model(inps)
@@ -184,7 +234,7 @@ class CATTransformerLM(HFLM):
             dtype=self.mixed_precision_dtype,
         ):
             for _ in range(max_new_tokens):
-                if isinstance(self._model, CAT_Transformer):
+                if isinstance(self._model, ADAPTIVE_MODELS):
                     logits = self._model(cur, chunk_size_power=self.chunk_size_power)
                 else:
                     logits = self._model(cur)
@@ -203,9 +253,9 @@ class CATTransformerLM(HFLM):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate with lm-evaluation-harness")
-    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked")
+    parser.add_argument("--model_type", type=str, required=True, help="Model type: vanilla, chunked, chunked_lookback, beacon")
     parser.add_argument("--tasks", type=str, required=True, help="Comma-separated task names (e.g. hellaswag,arc_easy)")
-    parser.add_argument("--chunk_size_power", type=int, default=4, help="Chunk size power for CAT (default: 4)")
+    parser.add_argument("--chunk_size_power", type=int, default=4, help="Chunk size power for CAT / beacon (default: 4)")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size (default: 1)")
     parser.add_argument("--device", type=str, default="cuda", help="Device (default: cuda)")
     parser.add_argument("--num_fewshot", type=int, default=0, help="Number of few-shot examples (default: 0)")

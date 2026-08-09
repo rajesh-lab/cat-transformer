@@ -11,18 +11,33 @@ defaults:
 # set the seed for reproducibility
 seed: 42
 
+# books3, filtered to documents of >= 16k tokens so every 16384-token window
+# sits inside a single book. See prepare_books3.py.
 dataset:
-    name: fineweb
+    name: books3
 
-    path: datasets/fineweb-50b-sharded-gpt2 # change dataset path accordingly!
+    path: datasets/books3-16k-gpt2
     tokenizer_name: "gpt2"
     vocab_size: 50257
 
-results_dir: Results # change dir for dumping results
+results_dir: Results
 
 wandb:
-    project: fineweb-15b
+    project: books3-16k-finetune
     exp_name: default
+
+################################################################################
+
+# Long-context extension. Only read by finetune.py; train.py ignores this group.
+finetune:
+
+    # weights to initialise from, loaded with strict=True
+    checkpoint_path: null
+
+    # RoPE theta. A no-op for rope_position_scheme=chunk_reset, where the max
+    # position index is chunk_size + n_beacons - 1 no matter how long the context
+    # is, so 4K -> 16K introduces no unseen positions. Matters for `compact`.
+    rope_base: 10000
 
 ################################################################################
 
@@ -30,26 +45,23 @@ wandb:
 train:
 
     # Number of optimizer steps between saving checkpoints
-    save_interval: 1000
+    save_interval: 3200
 
     # Number of workers for loading data
     num_workers: 4
 
     # Batch size
-    batch_size: 128
-
-    # Micro batch size
-    # micro_batch_size: 128
+    batch_size: 1
 
     # Number of optimizer steps, please modify according to the dataset and batch size
-    train_iters: 20000
+    train_iters: 16000
     train_epochs: -1
 
     # Warmup steps percentage
     warmup_steps_percentage: 0.1
 
     # Warm steps. If these are provided, warmup_steps_percentage is ignored.
-    warmup_steps: 1000
+    warmup_steps: 1600
 
     # Gradient clipping
     grad_norm: 1.0
@@ -57,7 +69,7 @@ train:
     # calculate grad norm after some train iters
     grad_norm_interval: 25
 
-    grad_accum: 1
+    grad_accum: 8
 
     norm_eps: 0.00001
 
@@ -65,19 +77,19 @@ train:
 eval:
 
     # Number of optimizer steps between testing
-    eval_interval: 2000
+    eval_interval: 1600
 
     # Iters for testing
-    eval_iters: 100
+    eval_iters: 50
 
 # Optimizer-related arguments
 optimizer:
 
-    # Learning rate 
-    lr: 8e-4
+    # Learning rate
+    lr: 4e-5
 
     # Minimum learning rate
-    min_lr: 8e-5
+    min_lr: 4e-6
 
     # Weight decay
     weight_decay: 0.1
@@ -90,13 +102,13 @@ optimizer:
 result_dir:
 
 # choose from [transformer, cat_transformer, cat_lookback_transformer, beacon_transformer]
-model_type: transformer
+model_type: beacon_transformer
 
 transformer:
     name: transformer
 
     dim: 768
-    block_size: 2048
+    block_size: 16384
 
     n_layer: 12
     n_head: 12
@@ -107,8 +119,8 @@ transformer:
 cat_transformer:
     name: cat_transformer
 
-    block_size: 2048
-    chunk_size: 16
+    block_size: 16384
+    chunk_size: 32
 
     use_fused_ops: True
     use_qk_norm: True
@@ -126,40 +138,16 @@ cat_transformer:
     compressor_n_head: 12
     compressor_n_layer: 3
 
-# CAT, but the decoder also reads the previous chunk's raw tokens. Each chunk is
-# written into two overlapping windows, so the sequence the decoder sees is ~2x longer.
-cat_lookback_transformer:
-    name: cat_lookback_transformer
-
-    block_size: 2048
-
-    # largest chunk size; training cycles over powers of two in [min_chunk_size, chunk_size]
-    chunk_size: 16
-    min_chunk_size: 4
-
-    use_fused_ops: True
-    use_qk_norm: True
-
-    # decoder
-    n_layer: 12
-    dim: 1536
-    n_head: 12
-    n_local_heads: -1
-
-    dim_fx: 1536
-
-    # compressor
-    compressor_dim: 768
-    compressor_n_head: 12
-    compressor_n_layer: 3
-
+# Must match the checkpoint being extended exactly, or the strict load fails:
+# Results/fineweb-15b/2026-08-02/16-42-00.098101 (pretrained at block_size 4096).
+# block_size is the only field that differs, and no parameter is sized by it.
 beacon_transformer:
     name: beacon_transformer
 
-    block_size: 2048
+    block_size: 16384
 
     # largest chunk size; training cycles over powers of two in [min_chunk_size, chunk_size]
-    chunk_size: 16
+    chunk_size: 32
     min_chunk_size: 4
 
     # beacon tokens appended per chunk, compression ratio is chunk_size / n_beacons
@@ -172,12 +160,15 @@ beacon_transformer:
     # compact packs the visible beacons into a prefix, as in the paper
     rope_position_scheme: chunk_reset
 
+    # overridden by finetune.rope_base when running finetune.py
+    rope_base: 10000
+
     use_fused_ops: True
     use_qk_norm: False
 
     n_layer: 12
-    dim: 768
-    n_head: 12
+    dim: 2048
+    n_head: 32
     n_local_heads: -1
 
 

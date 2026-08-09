@@ -70,6 +70,12 @@ class TransformerConfig:
     def __post_init__(self):
         if self.n_local_heads == -1:
             self.n_local_heads = self.n_head
+        if self.n_local_heads <= 0:
+            raise ValueError("n_local_heads must be a positive integer or -1")
+        if self.n_local_heads > self.n_head:
+            raise ValueError("n_local_heads cannot exceed n_head")
+        if self.n_head % self.n_local_heads != 0:
+            raise ValueError("n_head must be divisible by n_local_heads for grouped-query attention")
         if self.intermediate_size is None:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)

@@ -28,6 +28,15 @@ from cat_transformer_adaptive import (
     CAT_Transformer
 )
 
+from beacon_transformer import (
+    Beacon_Config,
+    Beacon_Transformer
+)
+
+from cat_lookback_transformer import (
+    CAT_Lookback_Transformer
+)
+
 
 def get_model(accelerate: Accelerator, cfg):
     # pass hyperparameters from the yaml config file to the transformer config
@@ -79,6 +88,7 @@ def get_model(accelerate: Accelerator, cfg):
             chunk_size=cfg.model.chunk_size, 
             dim=cfg.model.dim, 
             n_head=cfg.model.n_head,
+            n_local_heads=cfg.model.n_local_heads,
             n_layer=cfg.model.n_layer
         )
 
@@ -88,7 +98,77 @@ def get_model(accelerate: Accelerator, cfg):
         accelerate.print("CAT decoder config:", decoder_config)
         accelerate.print(model)
         return model
-    
+
+    elif "cat_lookback_transformer" == cfg.model.name:
+
+        compressor_config = CAT_Config(
+
+            vocab_size=cfg.dataset.vocab_size,
+            block_size=cfg.model.block_size,
+
+            use_fused_ops=False, # liger-kernels doesn't support vmaps
+            use_qk_norm=cfg.model.use_qk_norm,
+
+            chunk_size=cfg.model.chunk_size,
+            dim=cfg.model.compressor_dim,
+            n_head=cfg.model.compressor_n_head,
+            dim_fx=cfg.model.dim_fx,
+
+            n_layer=cfg.model.compressor_n_layer,
+        )
+
+        decoder_config = CAT_Config(
+
+            vocab_size=cfg.dataset.vocab_size,
+            block_size=cfg.model.block_size,
+
+            use_fused_ops=cfg.model.use_fused_ops,
+            use_qk_norm=cfg.model.use_qk_norm,
+
+            chunk_size=cfg.model.chunk_size,
+            dim=cfg.model.dim,
+            n_head=cfg.model.n_head,
+            n_local_heads=cfg.model.n_local_heads,
+            n_layer=cfg.model.n_layer,
+        )
+
+        model = CAT_Lookback_Transformer(decoder_config, compressor_config)
+
+        accelerate.print("CAT lookback compressor config:", compressor_config)
+        accelerate.print("CAT lookback decoder config:", decoder_config)
+        accelerate.print(model)
+        return model
+
+    elif "beacon_transformer" == cfg.model.name:
+
+        config = Beacon_Config(
+
+            vocab_size=cfg.dataset.vocab_size,
+            block_size=cfg.model.block_size,
+            norm_eps=cfg.train.norm_eps,
+
+            use_fused_ops=cfg.model.use_fused_ops,
+            use_qk_norm=cfg.model.use_qk_norm,
+
+            chunk_size=cfg.model.chunk_size,
+            n_beacons=cfg.model.n_beacons,
+            min_chunk_size=cfg.model.min_chunk_size,
+            beacon_share_proj=cfg.model.beacon_share_proj,
+            rope_position_scheme=cfg.model.rope_position_scheme,
+            rope_base=cfg.model.get("rope_base", 10000),
+
+            dim=cfg.model.dim,
+            n_head=cfg.model.n_head,
+            n_local_heads=cfg.model.n_local_heads,
+            n_layer=cfg.model.n_layer,
+        )
+
+        model = Beacon_Transformer(config)
+
+        accelerate.print("Activation Beacon config:", config)
+        accelerate.print(model)
+        return model
+
     else:
         raise ValueError(f"Unknown model type: {cfg['name']}")
 
